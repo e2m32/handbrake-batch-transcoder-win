@@ -1,0 +1,39 @@
+# Requirements for Transcode Videos Script v0.3.1
+# 
+# This script primarily uses Python standard library modules.
+# No external Python packages are currently required.
+#
+# External dependencies (must be installed separately):
+# 
+# 1. HandBrakeCLI: Command-line video transcoding tool
+#    Download from: https://handbrake.fr/downloads.php
+#    Used for: Video transcoding with presets and subtitle support
+#
+# 2. FFprobe (part of FFmpeg): Video analysis tool
+#    Download from: https://ffmpeg.org/download.html
+#    Used for: Video resolution detection, codec analysis, bitrate analysis
+#    Note: Required for pre-transcode analysis features (resolution checking,
+#          codec detection, and predicting likely file size increases)
+#
+# Installation notes:
+# - Both HandBrakeCLI and ffprobe must be available in your system PATH
+# - On Windows: Add installation directories to PATH environment variable
+# - On macOS: Install via Homebrew: brew install handbrake ffmpeg
+# - On Linux: Install via package manager: apt install handbrake-cli ffmpeg
+#
+# Python version: 3.6+
+# 
+# Standard library modules used:
+# - os
+# - subprocess
+# - shutil
+# - tempfile
+# - datetime
+# - csv
+# - threading
+# - concurrent.futures
+# - queue
+# - time
+# - sys
+
+# Future dependencies can be added here as needed
