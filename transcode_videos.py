@@ -9,9 +9,32 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import time
 import sys
+import signal
+import platform
+
+# Platform-specific imports
+IS_WINDOWS = platform.system() == "Windows"
+if IS_WINDOWS:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        WINDOWS_PROCESS_CONTROL = True
+        import msvcrt  # For Windows keyboard input
+    except ImportError:
+        WINDOWS_PROCESS_CONTROL = False
+        print("Warning: ctypes not available - process suspension disabled")
+else:
+    WINDOWS_PROCESS_CONTROL = False
+    try:
+        import select
+        import tty
+        import termios
+        UNIX_KEYBOARD_CONTROL = True
+    except ImportError:
+        UNIX_KEYBOARD_CONTROL = False
 
 # === Version ===
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 # === Config ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +55,171 @@ log_lock = threading.Lock()
 progress_data = {}
 progress_lock = threading.Lock()
 
-def update_progress(thread_id, filename, progress, status="Processing"):
+# Global state for pause/resume functionality
+worker_paused = threading.Event()
+worker_paused.set()  # Start unpaused
+shutdown_requested = threading.Event()  # Immediate shutdown
+graceful_shutdown_requested = threading.Event()  # Graceful shutdown (finish current jobs)
+pause_requested = threading.Event()  # Signal that pause was requested
+menu_thread = None
+
+# Windows process control functions
+def suspend_process(pid):
+    """Suspend a Windows process by PID"""
+    if not WINDOWS_PROCESS_CONTROL:
+        return False
+    
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_SUSPEND_RESUME = 0x0800
+        handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+        if handle:
+            # Use NtSuspendProcess from ntdll
+            ntdll = ctypes.windll.ntdll
+            ntdll.NtSuspendProcess(handle)
+            kernel32.CloseHandle(handle)
+            return True
+    except Exception as e:
+        print(f"Failed to suspend process {pid}: {e}")
+    return False
+
+def resume_process(pid):
+    """Resume a Windows process by PID"""
+    if not WINDOWS_PROCESS_CONTROL:
+        return False
+    
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_SUSPEND_RESUME = 0x0800
+        handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+        if handle:
+            # Use NtResumeProcess from ntdll
+            ntdll = ctypes.windll.ntdll
+            ntdll.NtResumeProcess(handle)
+            kernel32.CloseHandle(handle)
+            return True
+    except Exception as e:
+        print(f"Failed to resume process {pid}: {e}")
+    return False
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C interrupt - just set pause flag"""
+    if worker_paused.is_set():
+        print("\n" + "="*70)
+        print("🔸 PAUSING ALL WORKERS")
+        if WINDOWS_PROCESS_CONTROL:
+            print("🔸 HandBrake processes will be suspended")
+        else:
+            print("🔸 Progress display pausing (process suspension not available)")
+        print("🔸 Workers will pause at next checkpoint...")
+        print("="*70)
+        worker_paused.clear()  # Pause workers
+        pause_requested.set()  # Signal that pause was requested
+        
+        # Start menu thread
+        menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
+        menu_thread.start()
+
+def show_pause_menu():
+    """Show the pause menu and handle user input"""
+    # Wait a moment for workers to actually pause
+    time.sleep(1)
+    
+    print("\n" + "="*70)
+    print("🔹 ALL WORKERS ARE PAUSED")
+    print("="*70)
+    
+    while pause_requested.is_set():
+        try:
+            choice = input("🔹 [R]esume, [Q]uit immediately, or [S]hutdown after current files? ").lower().strip()
+            
+            if choice == 'r' or choice == 'resume':
+                print("🔸 RESUMING all workers...")
+                print("="*70)
+                worker_paused.set()  # Resume workers
+                pause_requested.clear()  # Clear pause request
+                break
+            elif choice == 'q' or choice == 'quit':
+                print("🔸 SHUTTING DOWN immediately (terminating current jobs)...")
+                print("="*70)
+                shutdown_requested.set()  # Immediate shutdown
+                worker_paused.set()  # Allow workers to see shutdown signal
+                pause_requested.clear()  # Clear pause request
+                break
+            elif choice == 's' or choice == 'shutdown':
+                print("🔸 GRACEFUL SHUTDOWN - letting current files finish...")
+                print("🔸 No new files will be started. Press Ctrl+C to force immediate shutdown.")
+                print("="*70)
+                graceful_shutdown_requested.set()  # Graceful shutdown
+                worker_paused.set()  # Allow workers to finish current files
+                pause_requested.clear()  # Clear pause request
+                break
+            else:
+                print("🔸 Invalid choice. Please enter R, Q, or S.")
+                
+        except (EOFError, KeyboardInterrupt):
+            # Handle Ctrl+C during menu input
+            print("\n🔸 RESUMING all workers...")
+            print("="*70)
+            worker_paused.set()
+            pause_requested.clear()  # Clear pause request
+            break
+
+def wait_if_paused(thread_id, filename):
+    """Check if workers should be paused and wait if necessary"""
+    # Check for immediate shutdown first
+    if shutdown_requested.is_set():
+        return None
+    
+    if not worker_paused.is_set():  # If workers should be paused
+        update_progress(thread_id, filename, None, "⏸ PAUSED")
+        if not SHOW_PROGRESS:
+            print(f"[{thread_id}] ⏸ PAUSED: {os.path.basename(filename)}")
+        
+        # Check if this is the first worker to pause and print separator
+        with progress_lock:
+            paused_count = sum(1 for data in progress_data.values() if data['status'] == '⏸ PAUSED')
+            if paused_count == 1:  # First worker to pause
+                print("\n" + "─"*70)
+                print("⏸ ALL WORKERS PAUSED - WAITING FOR RESUME COMMAND")
+                print("─"*70)
+        
+        # Wait for resume with periodic checks to avoid indefinite blocking
+        while not worker_paused.is_set() and not shutdown_requested.is_set():
+            if worker_paused.wait(timeout=0.1):  # Wait up to 100ms for better responsiveness
+                break
+            # Add periodic debug info to help track stuck workers
+            if int(time.time()) % 10 == 0:  # Every 10 seconds
+                if not SHOW_PROGRESS:
+                    print(f"[{thread_id}] 🔸 Still waiting for resume signal...")
+        
+        if shutdown_requested.is_set():
+            return None  # Signal cancellation due to shutdown
+        
+        # Double-check that we're actually resumed before continuing
+        if worker_paused.is_set():
+            if not SHOW_PROGRESS:
+                print(f"[{thread_id}] ▶ RESUMED: {os.path.basename(filename)}")
+        else:
+            # This shouldn't happen, but let's handle it gracefully
+            if not SHOW_PROGRESS:
+                print(f"[{thread_id}] ⚠ WARNING: Exited pause loop but worker_paused not set")
+    
+    # Check for immediate shutdown after resume
+    if shutdown_requested.is_set():
+        return None
+    
+    return True
+
+def check_shutdown():
+    """Check if shutdown has been requested"""
+    return shutdown_requested.is_set()
+
+def should_start_new_job():
+    """Check if new jobs should be started (false during graceful shutdown)"""
+    return not shutdown_requested.is_set() and not graceful_shutdown_requested.is_set()
+
+def update_progress(thread_id, filename, progress, status="Processing", extra_info=""):
     """Update progress for a specific thread"""
     if not SHOW_PROGRESS:
         return
@@ -40,8 +227,9 @@ def update_progress(thread_id, filename, progress, status="Processing"):
     with progress_lock:
         progress_data[thread_id] = {
             'filename': os.path.basename(filename),
-            'progress': progress,
-            'status': status
+            'progress': progress if progress is not None else 0,
+            'status': status,
+            'extra_info': extra_info
         }
         display_progress()
 
@@ -55,18 +243,45 @@ def display_progress():
     for _ in range(len(progress_data)):
         sys.stdout.write('\033[A\033[2K')  # Move up and clear line
     
-    # Display progress for each thread
-    for thread_id, data in progress_data.items():
-        filename = data['filename'][:40] + "..." if len(data['filename']) > 40 else data['filename']
+    # Sort threads by worker number for consistent display order
+    def get_worker_number(thread_id):
+        try:
+            if thread_id.startswith("Worker_"):
+                return int(thread_id.split("_")[1])
+            else:
+                return 999  # Put non-Worker threads at the end
+        except:
+            return 999
+    
+    sorted_threads = sorted(progress_data.keys(), key=get_worker_number)
+    
+    # Display progress for each thread in sorted order
+    for thread_id in sorted_threads:
+        data = progress_data[thread_id]
+        filename = data['filename']
         progress = data['progress']
         status = data['status']
+        extra_info = data.get('extra_info', '')
+        
+        # Truncate or pad filename to exactly 35 characters for consistent alignment
+        if len(filename) > 35:
+            display_filename = filename[:32] + "..."
+        else:
+            display_filename = filename.ljust(35)  # Left-justify and pad to 35 chars
         
         # Create progress bar
-        bar_length = 30
+        bar_length = 25
         filled_length = int(bar_length * progress / 100)
         bar = '█' * filled_length + '░' * (bar_length - filled_length)
         
-        print(f"[{thread_id}] {filename:<45} [{bar}] {progress:3.0f}% {status}")
+        # Format thread ID to be consistent width (pad to 9 chars to handle "Worker_X")
+        thread_display = f"[{thread_id}]".ljust(10)
+        
+        # Format the display line with consistent spacing
+        if extra_info:
+            print(f"{thread_display} {display_filename} [{bar}] {progress:5.1f}% {status} {extra_info}")
+        else:
+            print(f"{thread_display} {display_filename} [{bar}] {progress:5.1f}% {status}")
     
     sys.stdout.flush()
 
@@ -275,11 +490,21 @@ def transcode_file(filepath, root_backup_dir):
     dirpath, filename = os.path.split(filepath)
     name, ext = os.path.splitext(filename)
     
+    # Check for shutdown before starting
+    if not wait_if_paused(thread_id, filename):
+        # Don't log cancelled jobs as failed
+        return None  # Return None to indicate cancellation, not failure
+    
     # Initialize progress
     update_progress(thread_id, filename, 0, "Starting")
     
     # Check if video resolution is less than 1080p
     update_progress(thread_id, filename, 2, "Checking resolution")
+    
+    # Check for pause/shutdown
+    if not wait_if_paused(thread_id, filename):
+        return None  # Return None to indicate cancellation
+    
     should_skip, resolution_info = should_skip_resolution(filepath)
     
     if should_skip:
@@ -292,6 +517,11 @@ def transcode_file(filepath, root_backup_dir):
     
     # Check if transcoding will likely result in larger file
     update_progress(thread_id, filename, 4, "Analyzing codec")
+    
+    # Check for pause/shutdown
+    if not wait_if_paused(thread_id, filename):
+        return None  # Return None to indicate cancellation
+    
     should_skip_codec, codec_info = should_skip_likely_larger(filepath)
     
     if should_skip_codec:
@@ -301,7 +531,11 @@ def transcode_file(filepath, root_backup_dir):
         if not SHOW_PROGRESS:
             print(f"[{thread_id}] SKIP: Likely to be larger ({codec_info}): {filepath}")
         return True  # Return True since this is successful processing (just skipped)
-    
+
+    # Check for pause/shutdown before starting expensive transcode
+    if not wait_if_paused(thread_id, filename):
+        return None  # Return None to indicate cancellation
+
     if not SHOW_PROGRESS:
         print(f"[{thread_id}] Resolution: {resolution_info}, Codec: {codec_info} - proceeding with transcode")
     
@@ -353,31 +587,154 @@ def transcode_file(filepath, root_backup_dir):
     # Start transcoding with progress simulation
     start_time = time.time()
     result = None
+    handbrake_process = None
+    process_suspended = False
     
-    # Run HandBrake in a separate thread to allow progress updates
+    # Run HandBrake and capture real-time progress
     def run_handbrake():
-        nonlocal result
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        nonlocal result, handbrake_process
+        try:
+            handbrake_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            
+            stdout_lines = []
+            
+            # Read output line by line to capture progress
+            while True:
+                try:
+                    output = handbrake_process.stdout.readline()
+                    if output == '' and handbrake_process.poll() is not None:
+                        break
+                    if output:
+                        stdout_lines.append(output.strip())
+                        
+                        # Parse HandBrake progress output
+                        # HandBrake outputs progress like: "Encoding: task 1 of 1, 45.67 % (23.45 fps, avg 24.12 fps, ETA 00h15m42s)"
+                        if "Encoding:" in output and "%" in output:
+                            try:
+                                # Extract percentage from output
+                                percent_start = output.find("% (")
+                                if percent_start > 0:
+                                    # Look backwards for the percentage number
+                                    percent_text = output[:percent_start]
+                                    percent_parts = percent_text.split()
+                                    if percent_parts:
+                                        progress_percent = float(percent_parts[-1])
+                                        
+                                        # Extract additional info (fps, ETA)
+                                        extra_info = ""
+                                        if "fps," in output and "ETA" in output:
+                                            try:
+                                                # Extract current fps
+                                                fps_start = output.find("(") + 1
+                                                fps_end = output.find(" fps,")
+                                                if fps_start > 0 and fps_end > fps_start:
+                                                    fps = output[fps_start:fps_end]
+                                                    
+                                                # Extract ETA
+                                                eta_start = output.find("ETA ") + 4
+                                                eta_end = output.find(")", eta_start)
+                                                if eta_start > 3 and eta_end > eta_start:
+                                                    eta = output[eta_start:eta_end]
+                                                    extra_info = f"({fps} fps, ETA {eta})"
+                                            except:
+                                                pass
+                                        
+                                        # Update progress with real HandBrake progress
+                                        if worker_paused.is_set():  # Only update if not paused
+                                            update_progress(thread_id, filename, progress_percent, "Transcoding", extra_info)
+                            except (ValueError, IndexError):
+                                pass  # Ignore parsing errors
+                except (OSError, ValueError) as e:
+                    # Handle broken pipe or other I/O errors
+                    if handbrake_process and handbrake_process.poll() is not None:
+                        break  # Process has terminated
+                    else:
+                        break  # Stop reading on error
+            
+            # Get final result
+            result = handbrake_process.poll()
+            result = type('Result', (), {
+                'returncode': result,
+                'stdout': '\n'.join(stdout_lines),
+                'stderr': ''
+            })()
+            
+        except Exception as e:
+            # Handle any other exceptions in the HandBrake thread
+            result = type('Result', (), {
+                'returncode': -1,
+                'stdout': '',
+                'stderr': f'HandBrake thread error: {str(e)}'
+            })()
     
     import threading as thread_module
     handbrake_thread = thread_module.Thread(target=run_handbrake)
     handbrake_thread.start()
     
-    # Simulate progress while HandBrake is running
-    progress = 10
+    # Monitor for pause/resume while HandBrake is running
+    last_pause_check = time.time()
+    fallback_progress = 10  # Fallback progress for when we can't parse HandBrake output
+    
     while handbrake_thread.is_alive():
-        elapsed = time.time() - start_time
+        current_time = time.time()
         
-        # Estimate progress based on file size and elapsed time
-        # Rough estimate: 1 MB/second processing speed
+        # Check for pause/shutdown every 2 seconds
+        if current_time - last_pause_check > 2:
+            if not worker_paused.is_set() and not process_suspended:
+                # Actually suspend the HandBrake process (Windows only)
+                if WINDOWS_PROCESS_CONTROL and handbrake_process and handbrake_process.pid:
+                    if suspend_process(handbrake_process.pid):
+                        process_suspended = True
+                        if not SHOW_PROGRESS:
+                            print(f"[{thread_id}] 🔸 HandBrake process {handbrake_process.pid} suspended")
+                
+                update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED")
+                
+                # Wait for resume with timeout to allow signal handling
+                while not worker_paused.is_set() and not shutdown_requested.is_set():
+                    # Use a shorter timeout and add periodic status updates
+                    if worker_paused.wait(timeout=0.1):  # Check every 100ms for better responsiveness
+                        break
+                    # Update progress periodically to show we're still alive
+                    if int(time.time()) % 5 == 0:  # Every 5 seconds
+                        update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED (waiting)")
+                
+                # Resume the HandBrake process (Windows only)
+                if WINDOWS_PROCESS_CONTROL and process_suspended and handbrake_process and handbrake_process.pid:
+                    if resume_process(handbrake_process.pid):
+                        process_suspended = False
+                        if not SHOW_PROGRESS:
+                            print(f"[{thread_id}] ▶ HandBrake process {handbrake_process.pid} resumed")
+                    else:
+                        if not SHOW_PROGRESS:
+                            print(f"[{thread_id}] ⚠ WARNING: Failed to resume HandBrake process {handbrake_process.pid}")
+                
+                # Clear paused status and show we're back to work
+                update_progress(thread_id, filename, fallback_progress, "Transcoding")
+                
+                if shutdown_requested.is_set():
+                    # Terminate HandBrake and cleanup
+                    if handbrake_process:
+                        if WINDOWS_PROCESS_CONTROL and process_suspended:
+                            resume_process(handbrake_process.pid)  # Resume before terminating
+                        handbrake_process.terminate()
+                        handbrake_process.wait()
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    clear_progress(thread_id)
+                    return None  # Return None to indicate cancellation, not failure
+            
+            last_pause_check = current_time
+        
+        # Fallback progress estimation (only used if HandBrake progress parsing fails)
+        elapsed = time.time() - start_time
         estimated_time = original_size / (1024 * 1024)  # seconds
         if estimated_time > 0:
             time_progress = min(80, (elapsed / estimated_time) * 70 + 10)  # 10-80%
-            progress = max(progress, time_progress)
+            fallback_progress = max(fallback_progress, time_progress)
         else:
-            progress = min(80, progress + 1)
+            fallback_progress = min(80, fallback_progress + 1)
         
-        update_progress(thread_id, filename, progress, "Transcoding")
         time.sleep(1)
         
         # Prevent indefinite waiting
@@ -385,6 +742,19 @@ def transcode_file(filepath, root_backup_dir):
             break
     
     handbrake_thread.join()
+    
+    # Check for shutdown after HandBrake completes
+    if shutdown_requested.is_set():
+        # Immediate shutdown - cleanup and exit
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        clear_progress(thread_id)
+        return False
+    elif graceful_shutdown_requested.is_set():
+        # Graceful shutdown - finish this job but don't start new ones
+        if not SHOW_PROGRESS:
+            print(f"[{thread_id}] 🔸 Graceful shutdown - completing current job: {os.path.basename(filename)}")
+        # Continue with normal processing to finish this job
     
     update_progress(thread_id, filename, 85, "Finishing")
 
@@ -435,6 +805,12 @@ def transcode_file(filepath, root_backup_dir):
         log_result(filepath, f"skipped_larger_size_{compression_ratio:.3f}", original_size, transcoded_size)
         return True  # Return True since this is successful processing (just skipped)
 
+    # Check for pause/shutdown before final operations
+    if wait_if_paused(thread_id, filename) is None:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return None
+
     # Backup original (if enabled)
     if CREATE_BACKUPS:
         try:
@@ -478,10 +854,22 @@ def transcode_file(filepath, root_backup_dir):
 # === Worker function for thread pool ===
 def process_file_worker(filepath, root_backup_dir):
     """Worker function that processes a single file and handles exceptions"""
+    thread_id = threading.current_thread().name
     try:
-        return transcode_file(filepath, root_backup_dir)
+        result = transcode_file(filepath, root_backup_dir)
+        # Don't log cancelled jobs (None) - only log actual failures (False)
+        if result is False:
+            # Get original file size for failed operations
+            try:
+                original_size = os.path.getsize(filepath)
+                log_result(filepath, "failed", original_size)
+            except:
+                log_result(filepath, "failed")
+        return result
     except Exception as e:
-        print(f"ERROR: Exception during {filepath}: {e}")
+        print(f"ERROR: Exception in {thread_id} during {filepath}: {e}")
+        # Clear any progress display for this worker
+        clear_progress(thread_id)
         # Get original file size for failed operations
         try:
             original_size = os.path.getsize(filepath)
@@ -533,6 +921,15 @@ def process_directory(root_dir):
     if CREATE_BACKUPS:
         print(f"Backups will be stored in: {root_backup_dir}")
     print(f"Transcode Videos Script v{VERSION}")
+    
+    # Platform information
+    if WINDOWS_PROCESS_CONTROL:
+        print("🔸 Windows process control enabled - HandBrake processes can be paused/resumed")
+    elif IS_WINDOWS:
+        print("⚠️  Windows detected but process control unavailable - only progress display pausing")
+    else:
+        print(f"🔸 Running on {platform.system()} - process suspension not available, progress display pausing only")
+    
     print("=" * 50)
     
     # Process files using ThreadPoolExecutor
@@ -542,17 +939,57 @@ def process_directory(root_dir):
     skipped_larger = 0
     skipped_codec = 0
     
+    # Create a custom worker function that sets the thread name
+    worker_counter = 0
+    worker_name_map = {}  # Map to track worker names for consistency
+    
+    def named_worker(filepath, root_backup_dir):
+        nonlocal worker_counter
+        thread = threading.current_thread()
+        
+        # Assign a consistent worker name if not already assigned
+        if thread not in worker_name_map:
+            worker_counter += 1
+            worker_name_map[thread] = f"Worker_{worker_counter}"
+        
+        thread.name = worker_name_map[thread]
+        return process_file_worker(filepath, root_backup_dir)
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all tasks
-        future_to_file = {executor.submit(process_file_worker, filepath, root_backup_dir): filepath 
-                         for filepath in files_to_process}
+        future_to_file = {}
+        for filepath in files_to_process:
+            future = executor.submit(named_worker, filepath, root_backup_dir)
+            future_to_file[future] = filepath
         
         # Process completed tasks
+        completed_jobs = 0
+        total_jobs = len(files_to_process)
+        
         for future in as_completed(future_to_file):
+            completed_jobs += 1
+            
+            # Check for immediate shutdown before processing results
+            if shutdown_requested.is_set():
+                print(f"\n🔸 IMMEDIATE SHUTDOWN requested - cancelling remaining tasks...")
+                # Cancel remaining futures
+                for f in future_to_file:
+                    if not f.done():
+                        f.cancel()
+                break
+            
+            # Check for graceful shutdown
+            if graceful_shutdown_requested.is_set():
+                remaining_jobs = total_jobs - completed_jobs
+                if remaining_jobs > 0:
+                    print(f"\n🔸 GRACEFUL SHUTDOWN in progress - {remaining_jobs} jobs remaining...")
+                else:
+                    print("\n🔸 GRACEFUL SHUTDOWN complete - all jobs finished")
+                
             filepath = future_to_file[future]
             try:
                 success = future.result()
-                if success:
+                if success is True:
                     # Check if it was actually transcoded or skipped
                     processed_updated = load_processed_files()
                     if filepath in processed_updated:
@@ -567,8 +1004,9 @@ def process_directory(root_dir):
                             successful += 1
                     else:
                         successful += 1
-                else:
+                elif success is False:
                     failed += 1
+                # If success is None (cancelled), don't count it as anything
             except Exception as e:
                 print(f"ERROR: Unexpected exception for {filepath}: {e}")
                 failed += 1
@@ -584,6 +1022,9 @@ def process_directory(root_dir):
 # === Entry point ===
 if __name__ == "__main__":
     import sys
+    
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
     
     # Handle help flag
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
