@@ -1,7 +1,7 @@
-# Requirements for Transcode Videos Script v0.3.1
+# Requirements for Transcode Videos Script v0.4.0
 # 
-# This script primarily uses Python standard library modules.
-# No external Python packages are currently required.
+# This script uses only Python standard library modules - no pip packages required!
+# This design keeps the project lightweight and reduces dependency management complexity.
 #
 # External dependencies (must be installed separately):
 # 
@@ -21,19 +21,29 @@
 # - On macOS: Install via Homebrew: brew install handbrake ffmpeg
 # - On Linux: Install via package manager: apt install handbrake-cli ffmpeg
 #
-# Python version: 3.6+
+# Python version: 3.6+ (tested on 3.8, 3.9, 3.10, 3.11, 3.12)
 # 
 # Standard library modules used:
-# - os
-# - subprocess
-# - shutil
-# - tempfile
-# - datetime
-# - csv
-# - threading
-# - concurrent.futures
-# - queue
-# - time
-# - sys
+# - os                    (file system operations)
+# - subprocess            (external process execution)
+# - shutil               (file operations)
+# - tempfile             (temporary file handling)
+# - datetime             (timestamp generation)
+# - csv                  (logging functionality)
+# - threading            (multi-threading support)
+# - concurrent.futures   (thread pool execution)
+# - queue                (thread communication)
+# - time                 (timing operations)
+# - sys                  (system interface)
+# - signal               (signal handling for Ctrl+C)
+# - platform             (platform detection)
+# - json                 (JSON parsing for ffprobe output)
+#
+# Platform-specific modules (optional, for enhanced functionality):
+# - ctypes               (Windows API access for process suspension/resume)
+# - msvcrt               (Windows keyboard input handling)
+# - select               (Unix I/O multiplexing)
+# - tty                  (Unix terminal control)
+# - termios              (Unix terminal interface)
 
-# Future dependencies can be added here as needed
+# No pip packages required - all dependencies are part of Python standard library!
