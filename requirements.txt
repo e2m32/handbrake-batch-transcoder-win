@@ -1,4 +1,4 @@
-# Requirements for Transcode Videos Script v0.4.0
+# Requirements for Transcode Videos Script v0.5.0
 # 
 # This script uses only Python standard library modules - no pip packages required!
 # This design keeps the project lightweight and reduces dependency management complexity.
@@ -40,10 +40,16 @@
 # - json                 (JSON parsing for ffprobe output)
 #
 # Platform-specific modules (optional, for enhanced functionality):
-# - ctypes               (Windows API access for process suspension/resume)
-# - msvcrt               (Windows keyboard input handling)
+# - ctypes               (Windows API for process suspension/resume, console handlers)
+# - msvcrt               (Windows console I/O helpers)
 # - select               (Unix I/O multiplexing)
 # - tty                  (Unix terminal control)
 # - termios              (Unix terminal interface)
+
+# v0.5.0 highlights (no extra pip deps):
+# - Reliable Ctrl+C pause menu on Windows via SetConsoleCtrlHandler
+# - HandBrakeCLI launched in its own process group to avoid accidental kill
+# - Optional Windows process suspension of HandBrake during pause
+# - Improved logging: interrupted vs failed for clean retries
 
 # No pip packages required - all dependencies are part of Python standard library!

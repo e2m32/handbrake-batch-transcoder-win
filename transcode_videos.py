@@ -39,7 +39,7 @@ else:
 # (removed keyboard monitoring variables as they don't work with terminal Ctrl+C)
 
 # === Version ===
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # === Config ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,8 +67,7 @@ shutdown_requested = threading.Event()  # Immediate shutdown
 graceful_shutdown_requested = threading.Event()  # Graceful shutdown (finish current jobs)
 pause_requested = threading.Event()  # Signal that pause was requested
 menu_thread = None
-interrupted_workers = set()  # Track which workers were interrupted
-workers_lock = threading.Lock()  # Protect interrupted_workers set
+suppress_progress_display = threading.Event()  # When set, progress UI is muted
 
 # Windows Console Control Handler (reliable Ctrl+C on Windows)
 console_ctrl_handler_ref = None  # Keep a reference to prevent GC
@@ -92,6 +91,9 @@ def register_windows_ctrl_c_handler():
             if worker_paused.is_set():
                 worker_paused.clear()
             pause_requested.set()
+            suppress_progress_display.set()
+            # Give a moment for worker "PAUSED" messages to flush
+            time.sleep(0.1)
             # Start menu in a thread if not already running
             global menu_thread
             if menu_thread is None or not menu_thread.is_alive():
@@ -149,32 +151,6 @@ def resume_process(pid):
         print(f"Failed to resume process {pid}: {e}")
     return False
 
-def monitor_worker_interruptions():
-    """Monitor for worker interruptions and trigger pause menu automatically"""
-    global menu_thread
-    
-    while not shutdown_requested.is_set() and not graceful_shutdown_requested.is_set():
-        time.sleep(0.5)  # Check every 500ms
-        
-        with workers_lock:
-            if len(interrupted_workers) > 0 and not pause_requested.is_set():
-                # Workers were interrupted, trigger pause
-                print("\n" + "="*70)
-                print("🔸 WORKER INTERRUPTION DETECTED - TRIGGERING PAUSE")
-                print(f"🔸 Interrupted workers: {len(interrupted_workers)}")
-                print("="*70)
-                
-                worker_paused.clear()  # Pause remaining workers
-                pause_requested.set()  # Signal that pause was requested
-                
-                # Start menu thread if not already running
-                if menu_thread is None or not menu_thread.is_alive():
-                    menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
-                    menu_thread.start()
-                    print("🔸 Menu thread started")
-                
-                break  # Exit monitoring loop
-
 def signal_handler(signum, frame):
     """Handle Ctrl+C interrupt for pause/resume functionality"""
     print("\n" + "="*70)
@@ -203,29 +179,29 @@ def signal_handler(signum, frame):
 
 def show_pause_menu():
     """Show the pause menu and handle user input"""
-    # Wait a moment for workers to actually pause
-    print("🔸 DEBUG: show_pause_menu() called, waiting 1 second...")
-    time.sleep(1)
+    # Ensure progress is muted while showing menu
+    suppress_progress_display.set()
+    # Small delay to allow worker PAUSED messages to land
+    time.sleep(0.2)
     
     print("\n" + "="*70)
     print("🔹 ALL WORKERS ARE PAUSED")
     print("="*70)
+    sys.stdout.flush()
     
     while pause_requested.is_set():
         try:
-            print("🔸 DEBUG: Showing menu prompt...")
-            choice = input("🔹 [R]esume, [Q]uit immediately, or [S]hutdown after current files? ").lower().strip()
-            print(f"🔸 DEBUG: User choice: '{choice}'")
+            # Print prompt on a clean line and flush
+            sys.stdout.write("🔹 [R]esume, [Q]uit immediately, or [S]hutdown after current files? ")
+            sys.stdout.flush()
+            choice = input().lower().strip()
             
             if choice == 'r' or choice == 'resume':
                 print("🔸 RESUMING all workers...")
                 print("="*70)
                 worker_paused.set()  # Resume workers
                 pause_requested.clear()  # Clear pause request
-                
-                # Clear interrupted workers set
-                with workers_lock:
-                    interrupted_workers.clear()
+                suppress_progress_display.clear()  # Re-enable progress
                 
                 break
             elif choice == 'q' or choice == 'quit':
@@ -233,6 +209,7 @@ def show_pause_menu():
                 print("="*70)
                 shutdown_requested.set()  # Immediate shutdown
                 worker_paused.set()  # Allow workers to see shutdown signal
+                suppress_progress_display.clear()
                 pause_requested.clear()  # Clear pause request
                 break
             elif choice == 's' or choice == 'shutdown':
@@ -241,6 +218,7 @@ def show_pause_menu():
                 print("="*70)
                 graceful_shutdown_requested.set()  # Graceful shutdown
                 worker_paused.set()  # Allow workers to finish current files
+                suppress_progress_display.clear()
                 pause_requested.clear()  # Clear pause request
                 break
             else:
@@ -310,7 +288,7 @@ def should_start_new_job():
 
 def update_progress(thread_id, filename, progress, status="Processing", extra_info=""):
     """Update progress for a specific thread"""
-    if not SHOW_PROGRESS:
+    if not SHOW_PROGRESS or suppress_progress_display.is_set():
         return
     
     with progress_lock:
@@ -324,7 +302,7 @@ def update_progress(thread_id, filename, progress, status="Processing", extra_in
 
 def display_progress():
     """Display progress bars for all active threads"""
-    if not SHOW_PROGRESS or not progress_data:
+    if not SHOW_PROGRESS or not progress_data or suppress_progress_display.is_set():
         return
     
     # Clear previous lines
@@ -1029,11 +1007,7 @@ def process_file_worker(filepath, root_backup_dir):
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully - this should be treated as interruption
         print(f"INTERRUPTED: {thread_id} during {filepath}")
-        
-        # Register this worker as interrupted to trigger pause menu
-        with workers_lock:
-            interrupted_workers.add(thread_id)
-        
+
         clear_progress(thread_id)
         try:
             original_size = os.path.getsize(filepath)
@@ -1144,10 +1118,7 @@ def process_directory(root_dir):
         # Non-Windows: standard Python signal handler
         signal.signal(signal.SIGINT, signal_handler)
     
-    # Start worker interruption monitoring thread
-    monitor_thread = threading.Thread(target=monitor_worker_interruptions, daemon=True)
-    monitor_thread.start()
-    print("🔸 Worker interruption monitor started")
+    # Note: On Windows, console control handler is used; on other platforms SIGINT is used.
     
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1223,8 +1194,19 @@ def process_directory(root_dir):
                     worker_paused.clear()
                 pause_requested.set()
 
+                # Suppress progress rendering while the menu is active
+                suppress_progress_display.set()
+                # Give workers a moment to print their "PAUSED" status
+                time.sleep(0.25)
                 # Show menu synchronously in main thread to ensure prompt is visible
                 show_pause_menu()
+                suppress_progress_display.clear()
+                # After closing menu, force a redraw of progress once
+                with progress_lock:
+                    if SHOW_PROGRESS and progress_data:
+                        print()  # newline to separate menu
+                        sys.stdout.flush()
+                        display_progress()
 
                 # After menu returns, check for shutdown
                 if shutdown_requested.is_set():

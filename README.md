@@ -100,7 +100,7 @@ During execution, use **Ctrl+C** to access the pause menu:
 ```
 ⏸ WORKERS PAUSED - Choose an option:
 (R) Resume workers
-(I) Immediate shutdown - stop all workers now
+(Q) Quit immediately - stop all workers now
 (S) Graceful shutdown - finish current jobs then stop
 Choice: 
 ```
@@ -191,7 +191,13 @@ This reveals:
 
 ## Version History
 
-### v0.4.0 (Current)
+### v0.5.0 (Current)
+- Reliable Ctrl+C pause menu on Windows via console control handler
+- HandBrakeCLI launched in a new process group so Ctrl+C doesn't kill it
+- Optional Windows process suspension during pause for true pauses
+- Interrupted jobs are logged as "interrupted" (they retry), not "failed"
+
+### v0.4.0
 - **Fixed** cancelled jobs being logged as 'failed' in CSV
 - **Improved** worker display ordering (always numerical)
 - **Enhanced** pause/resume reliability with better state validation
