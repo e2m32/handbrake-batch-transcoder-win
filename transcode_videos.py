@@ -1276,6 +1276,10 @@ def process_directory(root_dir):
 if __name__ == "__main__":
     import sys
     
+    # Windows-only warning (do not exit)
+    if not IS_WINDOWS:
+        print("Warning: This script is designed for Windows. Some pause/resume features may not work on non-Windows systems.")
+
     # Default: register signal handler for Ctrl+C (overridden on Windows by console handler)
     signal.signal(signal.SIGINT, signal_handler)
     
