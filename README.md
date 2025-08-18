@@ -2,6 +2,23 @@
 
 A powerful, multi-threaded video transcoding tool built with Python and HandBrakeCLI. This script automatically processes video files in a directory structure, transcoding them to efficient formats while providing real-time progress tracking and intelligent pause/resume functionality.
 
+## Quick start
+
+```bash
+# Basic
+python transcode_videos.py /path/to/video/directory
+
+# Choose worker count
+python transcode_videos.py /path/to/video/directory 8
+
+# Reduce console noise or enable debug
+python transcode_videos.py /path/to/video/directory --quiet
+python transcode_videos.py /path/to/video/directory --verbose
+
+# Windows path example
+python transcode_videos.py "C:\\Videos\\Movies" 4 --quiet
+```
+
 ## Features
 
 ### 🎥 Smart Video Processing
