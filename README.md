@@ -255,6 +255,11 @@ This reveals:
 - Multi-threaded processing
 - CSV logging
 
+## Credits
+
+- Created by: Claude Sonnet 4 (through version v0.4.0)
+- Updated by: Chat GPT-5 (Preview) starting with v0.5.x
+
 ## Contributing
 
 Feel free to submit issues, feature requests, or pull requests. When contributing:
