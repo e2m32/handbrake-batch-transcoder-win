@@ -6,10 +6,12 @@ from datetime import datetime
 import csv
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
 import queue
 import time
 import sys
 import signal
+import ctypes
 import platform
 
 # Platform-specific imports
@@ -32,6 +34,9 @@ else:
         UNIX_KEYBOARD_CONTROL = True
     except ImportError:
         UNIX_KEYBOARD_CONTROL = False
+
+# Global state tracking
+# (removed keyboard monitoring variables as they don't work with terminal Ctrl+C)
 
 # === Version ===
 VERSION = "0.4.0"
@@ -62,6 +67,44 @@ shutdown_requested = threading.Event()  # Immediate shutdown
 graceful_shutdown_requested = threading.Event()  # Graceful shutdown (finish current jobs)
 pause_requested = threading.Event()  # Signal that pause was requested
 menu_thread = None
+interrupted_workers = set()  # Track which workers were interrupted
+workers_lock = threading.Lock()  # Protect interrupted_workers set
+
+# Windows Console Control Handler (reliable Ctrl+C on Windows)
+console_ctrl_handler_ref = None  # Keep a reference to prevent GC
+
+def register_windows_ctrl_c_handler():
+    """On Windows, register a console control handler to catch Ctrl+C and pause workers."""
+    if not IS_WINDOWS:
+        return
+    kernel32 = ctypes.windll.kernel32
+
+    CTRL_C_EVENT = 0
+    CTRL_BREAK_EVENT = 1
+
+    # Prototype: BOOL WINAPI HandlerRoutine(DWORD dwCtrlType)
+    HANDLER_ROUTINE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong)
+
+    def handler(ctrl_type):
+        # Only act on Ctrl+C or Ctrl+Break
+        if ctrl_type in (CTRL_C_EVENT, CTRL_BREAK_EVENT):
+            # Trigger pause without letting Python terminate
+            if worker_paused.is_set():
+                worker_paused.clear()
+            pause_requested.set()
+            # Start menu in a thread if not already running
+            global menu_thread
+            if menu_thread is None or not menu_thread.is_alive():
+                menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
+                menu_thread.start()
+            # Return True to indicate the event was handled (prevents default termination)
+            return True
+        # Not handled here
+        return False
+
+    global console_ctrl_handler_ref
+    console_ctrl_handler_ref = HANDLER_ROUTINE(handler)
+    kernel32.SetConsoleCtrlHandler(console_ctrl_handler_ref, True)
 
 # Windows process control functions
 def suspend_process(pid):
@@ -76,9 +119,11 @@ def suspend_process(pid):
         if handle:
             # Use NtSuspendProcess from ntdll
             ntdll = ctypes.windll.ntdll
-            ntdll.NtSuspendProcess(handle)
+            result = ntdll.NtSuspendProcess(handle)
             kernel32.CloseHandle(handle)
-            return True
+            return result == 0  # Success if result is 0
+        else:
+            print(f"Failed to open process {pid} for suspension")
     except Exception as e:
         print(f"Failed to suspend process {pid}: {e}")
     return False
@@ -95,17 +140,49 @@ def resume_process(pid):
         if handle:
             # Use NtResumeProcess from ntdll
             ntdll = ctypes.windll.ntdll
-            ntdll.NtResumeProcess(handle)
+            result = ntdll.NtResumeProcess(handle)
             kernel32.CloseHandle(handle)
-            return True
+            return result == 0  # Success if result is 0
+        else:
+            print(f"Failed to open process {pid} for resume")
     except Exception as e:
         print(f"Failed to resume process {pid}: {e}")
     return False
 
+def monitor_worker_interruptions():
+    """Monitor for worker interruptions and trigger pause menu automatically"""
+    global menu_thread
+    
+    while not shutdown_requested.is_set() and not graceful_shutdown_requested.is_set():
+        time.sleep(0.5)  # Check every 500ms
+        
+        with workers_lock:
+            if len(interrupted_workers) > 0 and not pause_requested.is_set():
+                # Workers were interrupted, trigger pause
+                print("\n" + "="*70)
+                print("🔸 WORKER INTERRUPTION DETECTED - TRIGGERING PAUSE")
+                print(f"🔸 Interrupted workers: {len(interrupted_workers)}")
+                print("="*70)
+                
+                worker_paused.clear()  # Pause remaining workers
+                pause_requested.set()  # Signal that pause was requested
+                
+                # Start menu thread if not already running
+                if menu_thread is None or not menu_thread.is_alive():
+                    menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
+                    menu_thread.start()
+                    print("🔸 Menu thread started")
+                
+                break  # Exit monitoring loop
+
 def signal_handler(signum, frame):
-    """Handle Ctrl+C interrupt - just set pause flag"""
+    """Handle Ctrl+C interrupt for pause/resume functionality"""
+    print("\n" + "="*70)
+    print("🔸 SIGNAL HANDLER CALLED - PAUSE TRIGGERED")
+    print(f"🔸 Signal: {signum}, worker_paused.is_set(): {worker_paused.is_set()}")
+    print("="*70)
+    
     if worker_paused.is_set():
-        print("\n" + "="*70)
         print("🔸 PAUSING ALL WORKERS")
         if WINDOWS_PROCESS_CONTROL:
             print("🔸 HandBrake processes will be suspended")
@@ -119,10 +196,15 @@ def signal_handler(signum, frame):
         # Start menu thread
         menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
         menu_thread.start()
+        print("🔸 Menu thread started")
+    else:
+        print("🔸 Workers are already paused. Use the pause menu to control.")
+        print("="*70)
 
 def show_pause_menu():
     """Show the pause menu and handle user input"""
     # Wait a moment for workers to actually pause
+    print("🔸 DEBUG: show_pause_menu() called, waiting 1 second...")
     time.sleep(1)
     
     print("\n" + "="*70)
@@ -131,13 +213,20 @@ def show_pause_menu():
     
     while pause_requested.is_set():
         try:
+            print("🔸 DEBUG: Showing menu prompt...")
             choice = input("🔹 [R]esume, [Q]uit immediately, or [S]hutdown after current files? ").lower().strip()
+            print(f"🔸 DEBUG: User choice: '{choice}'")
             
             if choice == 'r' or choice == 'resume':
                 print("🔸 RESUMING all workers...")
                 print("="*70)
                 worker_paused.set()  # Resume workers
                 pause_requested.clear()  # Clear pause request
+                
+                # Clear interrupted workers set
+                with workers_lock:
+                    interrupted_workers.clear()
+                
                 break
             elif choice == 'q' or choice == 'quit':
                 print("🔸 SHUTTING DOWN immediately (terminating current jobs)...")
@@ -594,13 +683,34 @@ def transcode_file(filepath, root_backup_dir):
     def run_handbrake():
         nonlocal result, handbrake_process
         try:
-            handbrake_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            # On Windows, create HandBrake in a new process group so Ctrl+C doesn't kill it
+            creationflags = 0
+            if IS_WINDOWS:
+                creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+            handbrake_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                creationflags=creationflags
+            )
             
             stdout_lines = []
             
             # Read output line by line to capture progress
             while True:
                 try:
+                    # Check if the process is still alive before reading
+                    if handbrake_process.poll() is not None:
+                        # Process has terminated, read any remaining output
+                        remaining_output = handbrake_process.stdout.read()
+                        if remaining_output:
+                            stdout_lines.extend(remaining_output.strip().split('\n'))
+                        break
+                    
                     output = handbrake_process.stdout.readline()
                     if output == '' and handbrake_process.poll() is not None:
                         break
@@ -640,7 +750,7 @@ def transcode_file(filepath, root_backup_dir):
                                                 pass
                                         
                                         # Update progress with real HandBrake progress
-                                        if worker_paused.is_set():  # Only update if not paused
+                                        if worker_paused.is_set() and not shutdown_requested.is_set():  # Only update if not paused and not shutting down
                                             update_progress(thread_id, filename, progress_percent, "Transcoding", extra_info)
                             except (ValueError, IndexError):
                                 pass  # Ignore parsing errors
@@ -674,72 +784,108 @@ def transcode_file(filepath, root_backup_dir):
     # Monitor for pause/resume while HandBrake is running
     last_pause_check = time.time()
     fallback_progress = 10  # Fallback progress for when we can't parse HandBrake output
+    was_paused_during_execution = False  # Track if we paused during this file
     
     while handbrake_thread.is_alive():
-        current_time = time.time()
-        
-        # Check for pause/shutdown every 2 seconds
-        if current_time - last_pause_check > 2:
-            if not worker_paused.is_set() and not process_suspended:
-                # Actually suspend the HandBrake process (Windows only)
-                if WINDOWS_PROCESS_CONTROL and handbrake_process and handbrake_process.pid:
-                    if suspend_process(handbrake_process.pid):
-                        process_suspended = True
-                        if not SHOW_PROGRESS:
-                            print(f"[{thread_id}] 🔸 HandBrake process {handbrake_process.pid} suspended")
-                
-                update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED")
-                
-                # Wait for resume with timeout to allow signal handling
-                while not worker_paused.is_set() and not shutdown_requested.is_set():
-                    # Use a shorter timeout and add periodic status updates
-                    if worker_paused.wait(timeout=0.1):  # Check every 100ms for better responsiveness
-                        break
-                    # Update progress periodically to show we're still alive
-                    if int(time.time()) % 5 == 0:  # Every 5 seconds
-                        update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED (waiting)")
-                
-                # Resume the HandBrake process (Windows only)
-                if WINDOWS_PROCESS_CONTROL and process_suspended and handbrake_process and handbrake_process.pid:
-                    if resume_process(handbrake_process.pid):
-                        process_suspended = False
-                        if not SHOW_PROGRESS:
-                            print(f"[{thread_id}] ▶ HandBrake process {handbrake_process.pid} resumed")
-                    else:
-                        if not SHOW_PROGRESS:
-                            print(f"[{thread_id}] ⚠ WARNING: Failed to resume HandBrake process {handbrake_process.pid}")
-                
-                # Clear paused status and show we're back to work
-                update_progress(thread_id, filename, fallback_progress, "Transcoding")
-                
-                if shutdown_requested.is_set():
-                    # Terminate HandBrake and cleanup
-                    if handbrake_process:
-                        if WINDOWS_PROCESS_CONTROL and process_suspended:
-                            resume_process(handbrake_process.pid)  # Resume before terminating
-                        handbrake_process.terminate()
-                        handbrake_process.wait()
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                    clear_progress(thread_id)
-                    return None  # Return None to indicate cancellation, not failure
-            
-            last_pause_check = current_time
-        
-        # Fallback progress estimation (only used if HandBrake progress parsing fails)
-        elapsed = time.time() - start_time
-        estimated_time = original_size / (1024 * 1024)  # seconds
-        if estimated_time > 0:
-            time_progress = min(80, (elapsed / estimated_time) * 70 + 10)  # 10-80%
-            fallback_progress = max(fallback_progress, time_progress)
-        else:
-            fallback_progress = min(80, fallback_progress + 1)
-        
-        time.sleep(1)
-        
-        # Prevent indefinite waiting
-        if elapsed > 3600:  # 1 hour timeout
-            break
+        try:
+            current_time = time.time()
+
+            # Check for pause/shutdown more frequently (every 0.5 seconds instead of 2)
+            if current_time - last_pause_check > 0.5:
+                if not worker_paused.is_set() and not process_suspended:
+                    # Mark that this file was paused during execution
+                    was_paused_during_execution = True
+
+                    if not SHOW_PROGRESS:
+                        print(f"[{thread_id}] 🔸 PAUSE DETECTED - Suspending HandBrake process...")
+
+                    # Actually suspend the HandBrake process (Windows only)
+                    if WINDOWS_PROCESS_CONTROL and handbrake_process and handbrake_process.pid:
+                        # Check if process is still alive before suspending
+                        if handbrake_process.poll() is None:  # Process is still running
+                            if suspend_process(handbrake_process.pid):
+                                process_suspended = True
+                                if not SHOW_PROGRESS:
+                                    print(f"[{thread_id}] 🔸 HandBrake process {handbrake_process.pid} suspended")
+                            else:
+                                if not SHOW_PROGRESS:
+                                    print(f"[{thread_id}] ⚠ WARNING: Failed to suspend HandBrake process {handbrake_process.pid}")
+                                was_paused_during_execution = True
+                        else:
+                            if not SHOW_PROGRESS:
+                                print(f"[{thread_id}] ⚠ WARNING: HandBrake process {handbrake_process.pid} already terminated")
+                            was_paused_during_execution = True
+
+                    update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED")
+
+                    # Wait for resume with timeout to allow signal handling
+                    while not worker_paused.is_set() and not shutdown_requested.is_set():
+                        # Use a shorter timeout and add periodic status updates
+                        if worker_paused.wait(timeout=0.1):  # Check every 100ms for better responsiveness
+                            break
+                        # Update progress periodically to show we're still alive
+                        if int(time.time()) % 5 == 0:  # Every 5 seconds
+                            update_progress(thread_id, filename, fallback_progress, "⏸ PAUSED (waiting)")
+
+                    # Resume the HandBrake process (Windows only)
+                    if WINDOWS_PROCESS_CONTROL and process_suspended and handbrake_process and handbrake_process.pid:
+                        # Check if process is still alive before resuming
+                        if handbrake_process.poll() is None:  # Process is still running
+                            if resume_process(handbrake_process.pid):
+                                process_suspended = False
+                                if not SHOW_PROGRESS:
+                                    print(f"[{thread_id}] ▶ HandBrake process {handbrake_process.pid} resumed")
+                            else:
+                                if not SHOW_PROGRESS:
+                                    print(f"[{thread_id}] ⚠ WARNING: Failed to resume HandBrake process {handbrake_process.pid}")
+                                # If resume failed, the process might be dead - this should be treated as interruption
+                                was_paused_during_execution = True
+                        else:
+                            if not SHOW_PROGRESS:
+                                print(f"[{thread_id}] ⚠ WARNING: HandBrake process {handbrake_process.pid} died while suspended")
+                            was_paused_during_execution = True
+                            process_suspended = False
+
+                    # Clear paused status and show we're back to work
+                    update_progress(thread_id, filename, fallback_progress, "Transcoding")
+
+                    if not SHOW_PROGRESS:
+                        print(f"[{thread_id}] ▶ RESUMING - HandBrake process should be active again")
+
+                    if shutdown_requested.is_set():
+                        # Terminate HandBrake and cleanup
+                        if handbrake_process:
+                            if WINDOWS_PROCESS_CONTROL and process_suspended:
+                                resume_process(handbrake_process.pid)  # Resume before terminating
+                            handbrake_process.terminate()
+                            handbrake_process.wait()
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        clear_progress(thread_id)
+                        # Log as interrupted, not failed, so it can be retried
+                        log_result(filepath, "interrupted", original_size)
+                        return None  # Return None to indicate cancellation, not failure
+
+                last_pause_check = current_time
+
+            # Fallback progress estimation (only used if HandBrake progress parsing fails)
+            elapsed = time.time() - start_time
+            estimated_time = original_size / (1024 * 1024)  # seconds
+            if estimated_time > 0:
+                time_progress = min(80, (elapsed / estimated_time) * 70 + 10)  # 10-80%
+                fallback_progress = max(fallback_progress, time_progress)
+            else:
+                fallback_progress = min(80, fallback_progress + 1)
+
+            time.sleep(1)
+
+            # Prevent indefinite waiting
+            if elapsed > 3600:  # 1 hour timeout
+                break
+
+        except KeyboardInterrupt:
+            # Swallow in worker loop; main thread owns the pause menu and orchestration
+            continue
     
     handbrake_thread.join()
     
@@ -749,7 +895,9 @@ def transcode_file(filepath, root_backup_dir):
         if os.path.exists(temp_path):
             os.remove(temp_path)
         clear_progress(thread_id)
-        return False
+        # Log as interrupted, not failed, so it can be retried
+        log_result(filepath, "interrupted", original_size)
+        return None
     elif graceful_shutdown_requested.is_set():
         # Graceful shutdown - finish this job but don't start new ones
         if not SHOW_PROGRESS:
@@ -758,6 +906,7 @@ def transcode_file(filepath, root_backup_dir):
     
     update_progress(thread_id, filename, 85, "Finishing")
 
+    # Check if HandBrake failed, but consider if it was paused during execution
     if result.returncode != 0:
         clear_progress(thread_id)
         if not SHOW_PROGRESS:
@@ -767,8 +916,16 @@ def transcode_file(filepath, root_backup_dir):
             print(f"[{thread_id}] STDERR: {result.stderr}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        log_result(filepath, "failed", original_size)
-        return False
+        
+        # If the file was paused during execution, treat failure as interruption
+        if was_paused_during_execution:
+            if not SHOW_PROGRESS:
+                print(f"[{thread_id}] INTERRUPTED: File was paused during execution, marking as interrupted for retry")
+            log_result(filepath, "interrupted", original_size)
+            return None  # Treat as interruption, not failure
+        else:
+            log_result(filepath, "failed", original_size)
+            return False
 
     # Check if temp file was actually created and has content
     if not os.path.exists(temp_path):
@@ -865,7 +1022,25 @@ def process_file_worker(filepath, root_backup_dir):
                 log_result(filepath, "failed", original_size)
             except:
                 log_result(filepath, "failed")
+        elif result is None:
+            # This was an interrupted/cancelled job, already logged as "interrupted"
+            pass
         return result
+    except KeyboardInterrupt:
+        # Handle Ctrl+C gracefully - this should be treated as interruption
+        print(f"INTERRUPTED: {thread_id} during {filepath}")
+        
+        # Register this worker as interrupted to trigger pause menu
+        with workers_lock:
+            interrupted_workers.add(thread_id)
+        
+        clear_progress(thread_id)
+        try:
+            original_size = os.path.getsize(filepath)
+            log_result(filepath, "interrupted", original_size)
+        except:
+            log_result(filepath, "interrupted")
+        return None
     except Exception as e:
         print(f"ERROR: Exception in {thread_id} during {filepath}: {e}")
         # Clear any progress display for this worker
@@ -911,6 +1086,12 @@ def process_directory(root_dir):
                     elif status.startswith("skipped_likely_larger_"):
                         print(f"SKIP: Likely to create larger file: {full_path}")
                         continue
+                    elif status == "interrupted":
+                        print(f"RETRY: Previously interrupted: {full_path}")
+                        # Allow interrupted files to be retried
+                    elif status == "failed":
+                        print(f"RETRY: Previously failed: {full_path}")
+                        # Allow failed files to be retried
                 files_to_process.append(full_path)
     
     if not files_to_process:
@@ -955,61 +1136,107 @@ def process_directory(root_dir):
         thread.name = worker_name_map[thread]
         return process_file_worker(filepath, root_backup_dir)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
-        future_to_file = {}
-        for filepath in files_to_process:
-            future = executor.submit(named_worker, filepath, root_backup_dir)
-            future_to_file[future] = filepath
+    # Register Ctrl+C handling
+    if IS_WINDOWS:
+        # Use Windows console control handler for reliable Ctrl+C pause
+        register_windows_ctrl_c_handler()
+    else:
+        # Non-Windows: standard Python signal handler
+        signal.signal(signal.SIGINT, signal_handler)
+    
+    # Start worker interruption monitoring thread
+    monitor_thread = threading.Thread(target=monitor_worker_interruptions, daemon=True)
+    monitor_thread.start()
+    print("🔸 Worker interruption monitor started")
+    
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all tasks
+            future_to_file = {}
+            for filepath in files_to_process:
+                future = executor.submit(named_worker, filepath, root_backup_dir)
+                future_to_file[future] = filepath
         
-        # Process completed tasks
+        # Process completed tasks with Ctrl+C pause support
         completed_jobs = 0
         total_jobs = len(files_to_process)
-        
-        for future in as_completed(future_to_file):
-            completed_jobs += 1
-            
-            # Check for immediate shutdown before processing results
-            if shutdown_requested.is_set():
-                print(f"\n🔸 IMMEDIATE SHUTDOWN requested - cancelling remaining tasks...")
-                # Cancel remaining futures
-                for f in future_to_file:
-                    if not f.done():
-                        f.cancel()
-                break
-            
-            # Check for graceful shutdown
-            if graceful_shutdown_requested.is_set():
-                remaining_jobs = total_jobs - completed_jobs
-                if remaining_jobs > 0:
-                    print(f"\n🔸 GRACEFUL SHUTDOWN in progress - {remaining_jobs} jobs remaining...")
-                else:
-                    print("\n🔸 GRACEFUL SHUTDOWN complete - all jobs finished")
-                
-            filepath = future_to_file[future]
+
+        pending = set(future_to_file.keys())
+        while pending:
             try:
-                success = future.result()
-                if success is True:
-                    # Check if it was actually transcoded or skipped
-                    processed_updated = load_processed_files()
-                    if filepath in processed_updated:
-                        status = processed_updated[filepath]
-                        if status.startswith("skipped_low_res_"):
-                            skipped_resolution += 1
-                        elif status.startswith("skipped_larger_size_"):
-                            skipped_larger += 1
-                        elif status.startswith("skipped_likely_larger_"):
-                            skipped_codec += 1
+                # Wait briefly for any completed futures, so we can catch Ctrl+C between waits
+                done, not_done = concurrent.futures.wait(pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+
+                for future in done:
+                    pending.discard(future)
+                    completed_jobs += 1
+
+                    # Check for immediate shutdown before processing results
+                    if shutdown_requested.is_set():
+                        print(f"\n🔸 IMMEDIATE SHUTDOWN requested - cancelling remaining tasks...")
+                        for f in pending:
+                            if not f.done():
+                                f.cancel()
+                        pending.clear()
+                        break
+
+                    # Check for graceful shutdown
+                    if graceful_shutdown_requested.is_set():
+                        remaining_jobs = total_jobs - completed_jobs
+                        if remaining_jobs > 0:
+                            print(f"\n🔸 GRACEFUL SHUTDOWN in progress - {remaining_jobs} jobs remaining...")
                         else:
-                            successful += 1
-                    else:
-                        successful += 1
-                elif success is False:
-                    failed += 1
-                # If success is None (cancelled), don't count it as anything
-            except Exception as e:
-                print(f"ERROR: Unexpected exception for {filepath}: {e}")
-                failed += 1
+                            print("\n🔸 GRACEFUL SHUTDOWN complete - all jobs finished")
+
+                    filepath = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if success is True:
+                            # Check if it was actually transcoded or skipped
+                            processed_updated = load_processed_files()
+                            if filepath in processed_updated:
+                                status = processed_updated[filepath]
+                                if status.startswith("skipped_low_res_"):
+                                    skipped_resolution += 1
+                                elif status.startswith("skipped_larger_size_"):
+                                    skipped_larger += 1
+                                elif status.startswith("skipped_likely_larger_"):
+                                    skipped_codec += 1
+                                else:
+                                    successful += 1
+                            else:
+                                successful += 1
+                        elif success is False:
+                            failed += 1
+                        # If success is None (cancelled), don't count it as anything
+                    except Exception as e:
+                        print(f"ERROR: Unexpected exception for {filepath}: {e}")
+                        failed += 1
+
+            except KeyboardInterrupt:
+                # Convert Ctrl+C in main thread into PAUSE and block here until input
+                print("\n" + "="*70)
+                print("🔸 Ctrl+C detected - PAUSING all workers and showing menu")
+                print("="*70)
+
+                if worker_paused.is_set():
+                    worker_paused.clear()
+                pause_requested.set()
+
+                # Show menu synchronously in main thread to ensure prompt is visible
+                show_pause_menu()
+
+                # After menu returns, check for shutdown
+                if shutdown_requested.is_set():
+                    print(f"\n🔸 IMMEDIATE SHUTDOWN requested from menu - cancelling remaining tasks...")
+                    for f in pending:
+                        if not f.done():
+                            f.cancel()
+                    break
+    
+    finally:
+        # Cleanup any remaining processes
+        print("🔸 Cleaning up...")
     
     print(f"\nProcessing complete!")
     print(f"Successful: {successful}")
