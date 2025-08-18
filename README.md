@@ -109,6 +109,12 @@ Choice:
 - **I** - Immediately terminate all workers and exit
 - **S** - Allow current jobs to finish, then gracefully exit
 
+#### UI options
+- Console clear around menu: toggle via `MENU_CLEAR_CONSOLE` (default: true)
+- Pre-menu settle delay: `MENU_SETTLE_MS` (default: 250 ms)
+- Quiet mode: add `--quiet` or `-q` to reduce console noise
+- Verbose mode: add `--verbose` or `-v` for extra debug output
+
 ## Output
 
 ### Progress Display
@@ -191,7 +197,12 @@ This reveals:
 
 ## Version History
 
-### v0.5.0 (Current)
+### v0.5.1 (Current)
+- Adds optional console clear/redraw around the pause menu for a crisper UI
+- Makes the pre-menu settle delay configurable via `MENU_SETTLE_MS`
+- Adds `--quiet`/`--verbose` flags to control console noise
+
+### v0.5.0
 - Reliable Ctrl+C pause menu on Windows via console control handler
 - HandBrakeCLI launched in a new process group so Ctrl+C doesn't kill it
 - Optional Windows process suspension during pause for true pauses

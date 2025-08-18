@@ -39,7 +39,7 @@ else:
 # (removed keyboard monitoring variables as they don't work with terminal Ctrl+C)
 
 # === Version ===
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # === Config ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +52,12 @@ CREATE_BACKUPS = False  # Whether to create backups of original files
 BACKUP_SUBDIR = "backups"  # Subdirectory name for backups (relative to processed directory)
 VERBOSE_HANDBRAKE = False  # Whether to use verbose output in HandBrake
 SHOW_PROGRESS = True  # Whether to show progress bars for each worker
+VERBOSE = False  # Extra debug output
+QUIET = False    # Minimal console noise (still prints final summary)
+
+# Pause menu UI behavior
+MENU_CLEAR_CONSOLE = True   # Clear console before showing the pause menu
+MENU_SETTLE_MS = 250        # Delay (ms) before showing menu so worker messages settle
 
 # Thread lock for log file access
 log_lock = threading.Lock()
@@ -93,7 +99,7 @@ def register_windows_ctrl_c_handler():
             pause_requested.set()
             suppress_progress_display.set()
             # Give a moment for worker "PAUSED" messages to flush
-            time.sleep(0.1)
+            time.sleep(MENU_SETTLE_MS / 1000.0)
             # Start menu in a thread if not already running
             global menu_thread
             if menu_thread is None or not menu_thread.is_alive():
@@ -153,36 +159,47 @@ def resume_process(pid):
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C interrupt for pause/resume functionality"""
-    print("\n" + "="*70)
-    print("🔸 SIGNAL HANDLER CALLED - PAUSE TRIGGERED")
-    print(f"🔸 Signal: {signum}, worker_paused.is_set(): {worker_paused.is_set()}")
-    print("="*70)
+    if VERBOSE and not QUIET:
+        print("\n" + "="*70)
+        print("🔸 SIGNAL HANDLER CALLED - PAUSE TRIGGERED")
+        print(f"🔸 Signal: {signum}, worker_paused.is_set(): {worker_paused.is_set()}")
+        print("="*70)
     
     if worker_paused.is_set():
-        print("🔸 PAUSING ALL WORKERS")
-        if WINDOWS_PROCESS_CONTROL:
-            print("🔸 HandBrake processes will be suspended")
-        else:
-            print("🔸 Progress display pausing (process suspension not available)")
-        print("🔸 Workers will pause at next checkpoint...")
-        print("="*70)
+        if VERBOSE and not QUIET:
+            print("🔸 PAUSING ALL WORKERS")
+            if WINDOWS_PROCESS_CONTROL:
+                print("🔸 HandBrake processes will be suspended")
+            else:
+                print("🔸 Progress display pausing (process suspension not available)")
+            print("🔸 Workers will pause at next checkpoint...")
+            print("="*70)
         worker_paused.clear()  # Pause workers
         pause_requested.set()  # Signal that pause was requested
         
         # Start menu thread
         menu_thread = threading.Thread(target=show_pause_menu, daemon=True)
         menu_thread.start()
-        print("🔸 Menu thread started")
+        if VERBOSE and not QUIET:
+            print("🔸 Menu thread started")
     else:
-        print("🔸 Workers are already paused. Use the pause menu to control.")
-        print("="*70)
+        if VERBOSE and not QUIET:
+            print("🔸 Workers are already paused. Use the pause menu to control.")
+            print("="*70)
 
 def show_pause_menu():
     """Show the pause menu and handle user input"""
     # Ensure progress is muted while showing menu
     suppress_progress_display.set()
     # Small delay to allow worker PAUSED messages to land
-    time.sleep(0.2)
+    time.sleep(MENU_SETTLE_MS / 1000.0)
+
+    # Optionally clear the console for a crisp menu
+    if MENU_CLEAR_CONSOLE:
+        try:
+            clear_console()
+        except Exception:
+            pass
     
     print("\n" + "="*70)
     print("🔹 ALL WORKERS ARE PAUSED")
@@ -232,6 +249,23 @@ def show_pause_menu():
             pause_requested.clear()  # Clear pause request
             break
 
+    # Redraw progress after menu if desired
+    if MENU_CLEAR_CONSOLE:
+        try:
+            clear_console()
+        except Exception:
+            pass
+    if SHOW_PROGRESS and progress_data and not suppress_progress_display.is_set():
+        print()
+        sys.stdout.flush()
+        display_progress()
+
+def clear_console():
+    """Clear the terminal screen and move cursor to home position."""
+    # ANSI clear screen and home cursor
+    sys.stdout.write('\033[2J\033[H')
+    sys.stdout.flush()
+
 def wait_if_paused(thread_id, filename):
     """Check if workers should be paused and wait if necessary"""
     # Check for immediate shutdown first
@@ -240,7 +274,7 @@ def wait_if_paused(thread_id, filename):
     
     if not worker_paused.is_set():  # If workers should be paused
         update_progress(thread_id, filename, None, "⏸ PAUSED")
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] ⏸ PAUSED: {os.path.basename(filename)}")
         
         # Check if this is the first worker to pause and print separator
@@ -257,7 +291,7 @@ def wait_if_paused(thread_id, filename):
                 break
             # Add periodic debug info to help track stuck workers
             if int(time.time()) % 10 == 0:  # Every 10 seconds
-                if not SHOW_PROGRESS:
+                if not QUIET and not SHOW_PROGRESS:
                     print(f"[{thread_id}] 🔸 Still waiting for resume signal...")
         
         if shutdown_requested.is_set():
@@ -265,11 +299,11 @@ def wait_if_paused(thread_id, filename):
         
         # Double-check that we're actually resumed before continuing
         if worker_paused.is_set():
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] ▶ RESUMED: {os.path.basename(filename)}")
         else:
             # This shouldn't happen, but let's handle it gracefully
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] ⚠ WARNING: Exited pause loop but worker_paused not set")
     
     # Check for immediate shutdown after resume
@@ -603,7 +637,7 @@ def transcode_file(filepath, root_backup_dir):
     if not wait_if_paused(thread_id, filename):
         return None  # Return None to indicate cancellation
 
-    if not SHOW_PROGRESS:
+    if not QUIET and not SHOW_PROGRESS:
         print(f"[{thread_id}] Resolution: {resolution_info}, Codec: {codec_info} - proceeding with transcode")
     
     # Use a local temp directory instead of network path for better reliability
@@ -630,7 +664,7 @@ def transcode_file(filepath, root_backup_dir):
     if VERBOSE_HANDBRAKE:
         cmd.append("--verbose=1")
 
-    if not SHOW_PROGRESS:
+    if not QUIET and not SHOW_PROGRESS:
         print(f"[{thread_id}] Transcoding: {filepath} ({original_size / (1024*1024):.2f} MB)")
         print(f"[{thread_id}] Temp file: {temp_path}")
     
@@ -641,14 +675,14 @@ def transcode_file(filepath, root_backup_dir):
         import shutil
         total, used, free = shutil.disk_usage(local_temp_dir)
         free_gb = free / (1024**3)
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] Free disk space: {free_gb:.2f} GB")
         
         if free_gb < 10:  # Less than 10GB free
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] WARNING: Low disk space ({free_gb:.2f} GB)")
     except Exception as e:
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] Could not check disk space: {e}")
     
     # Start transcoding with progress simulation
@@ -774,7 +808,7 @@ def transcode_file(filepath, root_backup_dir):
                     # Mark that this file was paused during execution
                     was_paused_during_execution = True
 
-                    if not SHOW_PROGRESS:
+                    if not QUIET and not SHOW_PROGRESS:
                         print(f"[{thread_id}] 🔸 PAUSE DETECTED - Suspending HandBrake process...")
 
                     # Actually suspend the HandBrake process (Windows only)
@@ -783,14 +817,14 @@ def transcode_file(filepath, root_backup_dir):
                         if handbrake_process.poll() is None:  # Process is still running
                             if suspend_process(handbrake_process.pid):
                                 process_suspended = True
-                                if not SHOW_PROGRESS:
+                                if not QUIET and not SHOW_PROGRESS:
                                     print(f"[{thread_id}] 🔸 HandBrake process {handbrake_process.pid} suspended")
                             else:
-                                if not SHOW_PROGRESS:
+                                if not QUIET and not SHOW_PROGRESS:
                                     print(f"[{thread_id}] ⚠ WARNING: Failed to suspend HandBrake process {handbrake_process.pid}")
                                 was_paused_during_execution = True
                         else:
-                            if not SHOW_PROGRESS:
+                            if not QUIET and not SHOW_PROGRESS:
                                 print(f"[{thread_id}] ⚠ WARNING: HandBrake process {handbrake_process.pid} already terminated")
                             was_paused_during_execution = True
 
@@ -811,15 +845,15 @@ def transcode_file(filepath, root_backup_dir):
                         if handbrake_process.poll() is None:  # Process is still running
                             if resume_process(handbrake_process.pid):
                                 process_suspended = False
-                                if not SHOW_PROGRESS:
+                                if not QUIET and not SHOW_PROGRESS:
                                     print(f"[{thread_id}] ▶ HandBrake process {handbrake_process.pid} resumed")
                             else:
-                                if not SHOW_PROGRESS:
+                                if not QUIET and not SHOW_PROGRESS:
                                     print(f"[{thread_id}] ⚠ WARNING: Failed to resume HandBrake process {handbrake_process.pid}")
                                 # If resume failed, the process might be dead - this should be treated as interruption
                                 was_paused_during_execution = True
                         else:
-                            if not SHOW_PROGRESS:
+                            if not QUIET and not SHOW_PROGRESS:
                                 print(f"[{thread_id}] ⚠ WARNING: HandBrake process {handbrake_process.pid} died while suspended")
                             was_paused_during_execution = True
                             process_suspended = False
@@ -827,7 +861,7 @@ def transcode_file(filepath, root_backup_dir):
                     # Clear paused status and show we're back to work
                     update_progress(thread_id, filename, fallback_progress, "Transcoding")
 
-                    if not SHOW_PROGRESS:
+                    if not QUIET and not SHOW_PROGRESS:
                         print(f"[{thread_id}] ▶ RESUMING - HandBrake process should be active again")
 
                     if shutdown_requested.is_set():
@@ -897,7 +931,7 @@ def transcode_file(filepath, root_backup_dir):
         
         # If the file was paused during execution, treat failure as interruption
         if was_paused_during_execution:
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] INTERRUPTED: File was paused during execution, marking as interrupted for retry")
             log_result(filepath, "interrupted", original_size)
             return None  # Treat as interruption, not failure
@@ -908,7 +942,7 @@ def transcode_file(filepath, root_backup_dir):
     # Check if temp file was actually created and has content
     if not os.path.exists(temp_path):
         clear_progress(thread_id)
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] ERROR: Temp file was not created: {temp_path}")
         log_result(filepath, "failed", original_size)
         return False
@@ -917,7 +951,7 @@ def transcode_file(filepath, root_backup_dir):
     transcoded_size = os.path.getsize(temp_path)
     if transcoded_size == 0:
         clear_progress(thread_id)
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] ERROR: Transcoded file is empty: {temp_path}")
         os.remove(temp_path)
         log_result(filepath, "failed", original_size)
@@ -929,7 +963,7 @@ def transcode_file(filepath, root_backup_dir):
     # Check if transcoded file is larger than original
     if transcoded_size >= original_size:
         clear_progress(thread_id)
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] SKIP: Transcoded file is larger ({transcoded_size / (1024*1024):.2f} MB >= {original_size / (1024*1024):.2f} MB): {filepath}")
         
         # Remove the temp file since we're not using it
@@ -956,10 +990,10 @@ def transcode_file(filepath, root_backup_dir):
             
             os.makedirs(backup_file_dir, exist_ok=True)
             shutil.copy2(filepath, backup_file_path)
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] Backup created: {backup_file_path}")
         except Exception as e:
-            if not SHOW_PROGRESS:
+            if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] WARNING: Could not create backup: {e}")
 
     update_progress(thread_id, filename, 95, "Finalizing")
@@ -973,13 +1007,13 @@ def transcode_file(filepath, root_backup_dir):
         time.sleep(0.5)  # Brief pause to show completion
         clear_progress(thread_id)
         
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] SUCCESS: {filepath} ({original_size / (1024*1024):.2f} MB -> {transcoded_size / (1024*1024):.2f} MB, ratio: {compression_ratio:.3f})")
         
         return True
     except Exception as e:
         clear_progress(thread_id)
-        if not SHOW_PROGRESS:
+        if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] ERROR: Could not move file from {temp_path} to {filepath}: {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -1049,22 +1083,28 @@ def process_directory(root_dir):
                 if full_path in processed:
                     status = processed[full_path]
                     if status == "success":
-                        print(f"SKIP: Already processed: {full_path}")
+                        if not QUIET:
+                            print(f"SKIP: Already processed: {full_path}")
                         continue
                     elif status.startswith("skipped_low_res_"):
-                        print(f"SKIP: Low resolution already checked: {full_path}")
+                        if not QUIET:
+                            print(f"SKIP: Low resolution already checked: {full_path}")
                         continue
                     elif status.startswith("skipped_larger_size_"):
-                        print(f"SKIP: Transcoding would increase file size: {full_path}")
+                        if not QUIET:
+                            print(f"SKIP: Transcoding would increase file size: {full_path}")
                         continue
                     elif status.startswith("skipped_likely_larger_"):
-                        print(f"SKIP: Likely to create larger file: {full_path}")
+                        if not QUIET:
+                            print(f"SKIP: Likely to create larger file: {full_path}")
                         continue
                     elif status == "interrupted":
-                        print(f"RETRY: Previously interrupted: {full_path}")
+                        if not QUIET:
+                            print(f"RETRY: Previously interrupted: {full_path}")
                         # Allow interrupted files to be retried
                     elif status == "failed":
-                        print(f"RETRY: Previously failed: {full_path}")
+                        if not QUIET:
+                            print(f"RETRY: Previously failed: {full_path}")
                         # Allow failed files to be retried
                 files_to_process.append(full_path)
     
@@ -1072,20 +1112,21 @@ def process_directory(root_dir):
         print("No video files to process.")
         return
     
-    print(f"Found {len(files_to_process)} video files to process using {MAX_WORKERS} threads.")
-    if CREATE_BACKUPS:
-        print(f"Backups will be stored in: {root_backup_dir}")
-    print(f"Transcode Videos Script v{VERSION}")
+    if not QUIET:
+        print(f"Found {len(files_to_process)} video files to process using {MAX_WORKERS} threads.")
+        if CREATE_BACKUPS:
+            print(f"Backups will be stored in: {root_backup_dir}")
+        print(f"Transcode Videos Script v{VERSION}")
     
     # Platform information
-    if WINDOWS_PROCESS_CONTROL:
-        print("🔸 Windows process control enabled - HandBrake processes can be paused/resumed")
-    elif IS_WINDOWS:
-        print("⚠️  Windows detected but process control unavailable - only progress display pausing")
-    else:
-        print(f"🔸 Running on {platform.system()} - process suspension not available, progress display pausing only")
-    
-    print("=" * 50)
+    if not QUIET:
+        if WINDOWS_PROCESS_CONTROL:
+            print("🔸 Windows process control enabled - HandBrake processes can be paused/resumed")
+        elif IS_WINDOWS:
+            print("⚠️  Windows detected but process control unavailable - only progress display pausing")
+        else:
+            print(f"🔸 Running on {platform.system()} - process suspension not available, progress display pausing only")
+        print("=" * 50)
     
     # Process files using ThreadPoolExecutor
     successful = 0
@@ -1186,9 +1227,10 @@ def process_directory(root_dir):
 
             except KeyboardInterrupt:
                 # Convert Ctrl+C in main thread into PAUSE and block here until input
-                print("\n" + "="*70)
-                print("🔸 Ctrl+C detected - PAUSING all workers and showing menu")
-                print("="*70)
+                if VERBOSE and not QUIET:
+                    print("\n" + "="*70)
+                    print("🔸 Ctrl+C detected - PAUSING all workers and showing menu")
+                    print("="*70)
 
                 if worker_paused.is_set():
                     worker_paused.clear()
@@ -1197,7 +1239,7 @@ def process_directory(root_dir):
                 # Suppress progress rendering while the menu is active
                 suppress_progress_display.set()
                 # Give workers a moment to print their "PAUSED" status
-                time.sleep(0.25)
+                time.sleep(MENU_SETTLE_MS / 1000.0)
                 # Show menu synchronously in main thread to ensure prompt is visible
                 show_pause_menu()
                 suppress_progress_display.clear()
@@ -1218,8 +1260,10 @@ def process_directory(root_dir):
     
     finally:
         # Cleanup any remaining processes
-        print("🔸 Cleaning up...")
+        if VERBOSE and not QUIET:
+            print("🔸 Cleaning up...")
     
+    # Always print final summary, even in quiet mode
     print(f"\nProcessing complete!")
     print(f"Successful: {successful}")
     print(f"Skipped (low resolution): {skipped_resolution}")
@@ -1232,7 +1276,7 @@ def process_directory(root_dir):
 if __name__ == "__main__":
     import sys
     
-    # Register signal handler for Ctrl+C
+    # Default: register signal handler for Ctrl+C (overridden on Windows by console handler)
     signal.signal(signal.SIGINT, signal_handler)
     
     # Handle help flag
@@ -1270,27 +1314,42 @@ if __name__ == "__main__":
         print("  python transcode_videos.py \"C:\\Videos\\Movies\" 2")
         sys.exit(0)
     
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
+    # Simple flag parsing for -q/--quiet and -v/--verbose
+    args = sys.argv[1:]
+    parsed_args = []
+    for a in args:
+        if a in ("-q", "--quiet"):
+            QUIET = True
+        elif a in ("-v", "--verbose"):
+            VERBOSE = True
+        else:
+            parsed_args.append(a)
+
+    if len(parsed_args) < 1 or len(parsed_args) > 2:
         print(f"Transcode Videos Script v{VERSION}")
-        print("Usage: python transcode_videos.py /path/to/videos [max_workers]")
+        print("Usage: python transcode_videos.py [/path/to/videos] [max_workers] [--quiet|-q] [--verbose|-v]")
         print("  max_workers: Number of concurrent operations (default: 4)")
         print("Use -h or --help for detailed information.")
         sys.exit(1)
 
-    input_dir = sys.argv[1]
+    input_dir = parsed_args[0]
     if not os.path.isdir(input_dir):
         print(f"Invalid directory: {input_dir}")
         sys.exit(1)
 
     # Optional: Allow user to specify number of workers
-    if len(sys.argv) == 3:
+    if len(parsed_args) == 2:
         try:
-            MAX_WORKERS = int(sys.argv[2])
+            MAX_WORKERS = int(parsed_args[1])
             if MAX_WORKERS < 1:
                 print("max_workers must be at least 1")
                 sys.exit(1)
         except ValueError:
             print("max_workers must be a valid integer")
             sys.exit(1)
+
+    # If quiet, suppress progress rendering globally (without enabling debug prints)
+    if QUIET:
+        suppress_progress_display.set()
 
     process_directory(input_dir)
