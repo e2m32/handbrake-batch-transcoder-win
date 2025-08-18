@@ -1,0 +1,15 @@
+# Logs
+transcode_log.csv
+retranscode_log.csv
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+$RECYCLE.BIN/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
