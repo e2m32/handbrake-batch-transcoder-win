@@ -70,15 +70,14 @@ Edit the configuration variables at the top of `transcode_videos.py`:
 
 ```python
 # === Configuration ===
-MAX_WORKERS = 6                    # Number of concurrent transcoding workers
-CREATE_BACKUPS = True              # Create backup copies of original files
-BACKUP_SUBDIR = "original_backups" # Backup directory name
-SHOW_PROGRESS = True               # Enable real-time progress bars
-MIN_RESOLUTION_WIDTH = 1280        # Skip videos below this width
-MIN_RESOLUTION_HEIGHT = 720        # Skip videos below this height
+MAX_WORKERS = 4               # Number of concurrent transcoding workers
+CREATE_BACKUPS = False        # Create backup copies of original files
+BACKUP_SUBDIR = "backups"     # Backup directory name
+SHOW_PROGRESS = True          # Enable real-time progress bars
 
 # HandBrake settings
-HANDBRAKE_PRESET = "Very Fast 1080p30"  # HandBrake encoding preset
+PRESET = "Fast 1080p30 Subs"           # HandBrake encoding preset (by name)
+PRESET_JSON = "fast1080p30subs.json"   # Preset file path (imported at runtime)
 ```
 
 ## Usage
@@ -91,6 +90,12 @@ python transcode_videos.py /path/to/video/directory
 ### With Custom Worker Count
 ```bash
 python transcode_videos.py /path/to/video/directory 4
+```
+
+### With Flags (quiet/verbose)
+```bash
+python transcode_videos.py /path/to/video/directory --quiet
+python transcode_videos.py /path/to/video/directory 8 --verbose
 ```
 
 ### Interactive Controls
@@ -106,7 +111,7 @@ Choice:
 ```
 
 - **R** - Resume all workers and continue processing
-- **I** - Immediately terminate all workers and exit
+- **Q** - Immediately terminate all workers and exit
 - **S** - Allow current jobs to finish, then gracefully exit
 
 #### UI options
