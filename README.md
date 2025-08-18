@@ -2,6 +2,8 @@
 
 A powerful, multi-threaded video transcoding tool built with Python and HandBrakeCLI. This script automatically processes video files in a directory structure, transcoding them to efficient formats while providing real-time progress tracking and intelligent pause/resume functionality.
 
+> Compatibility: Windows only. The pause menu and process control rely on Windows console APIs. Linux and macOS are not supported.
+
 ## Quick start
 
 ```bash
@@ -45,14 +47,15 @@ python transcode_videos.py "C:\\Videos\\Movies" 4 --quiet
 - **Size comparison** - Before/after file sizes and compression ratios
 - **Intelligent skip detection** - Separate tracking for different skip reasons
 
-### 🔧 Cross-platform Support
+### 🔧 Windows-only Support
 - **Windows process control** - Full process suspension/resume support
-- **Unix fallback** - Graceful degradation on non-Windows systems
-- **Path handling** - Robust file path management across platforms
+- **Tested environments** - Windows 10/11, PowerShell and Windows Terminal
+- **PATH requirements** - `HandBrakeCLI` and `ffprobe` must be available in PATH
 
 ## Prerequisites
 
 ### Required Software
+- **Supported OS** - Windows 10/11 (64-bit)
 - **Python 3.6+** - Core runtime
 - **HandBrakeCLI** - Video transcoding engine
   - Download from: https://handbrake.fr/downloads2.php
@@ -257,7 +260,7 @@ This reveals:
 Feel free to submit issues, feature requests, or pull requests. When contributing:
 
 1. **Test thoroughly** with various video formats and scenarios
-2. **Maintain cross-platform compatibility** 
+2. **Maintain Windows compatibility** 
 3. **Update documentation** for any new features
 4. **Follow existing code style** and commenting patterns
 
