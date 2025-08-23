@@ -39,7 +39,7 @@ else:
 # (removed keyboard monitoring variables as they don't work with terminal Ctrl+C)
 
 # === Version ===
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # === Config ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

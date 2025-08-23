@@ -43,7 +43,8 @@ python transcode_videos.py "C:\\Videos\\Movies" 4 --quiet
 
 ### 📊 Comprehensive Logging
 - **CSV progress tracking** - Detailed logs of all processed files
-- **Status categorization** - Success, failed, skipped (various reasons)
+- **Status categorization** - success, skipped_* categories, interrupted
+- **Separate failed log** - `transcode_failed_log.csv` stores only failures; main log stays clean
 - **Size comparison** - Before/after file sizes and compression ratios
 - **Intelligent skip detection** - Separate tracking for different skip reasons
 
@@ -222,7 +223,13 @@ This reveals:
 
 ## Version History
 
-### v0.5.1 (Current)
+### v0.5.2 (Current)
+- Separate failed runs into `transcode_failed_log.csv`
+- Added UNC network share wait/retry (configurable) to survive network adapter sleep
+- Added network recovery constants (`NETWORK_CHECK_INTERVAL`, `NETWORK_MAX_WAIT`, `NETWORK_RETRY_ENABLED`)
+- Internal refactors / minor robustness fixes
+
+### v0.5.1
 - Adds optional console clear/redraw around the pause menu for a crisper UI
 - Makes the pre-menu settle delay configurable via `MENU_SETTLE_MS`
 - Adds `--quiet`/`--verbose` flags to control console noise
