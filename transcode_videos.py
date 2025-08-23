@@ -57,6 +57,11 @@ SHOW_PROGRESS = True  # Whether to show progress bars for each worker
 VERBOSE = False  # Extra debug output
 QUIET = False    # Minimal console noise (still prints final summary)
 
+# Network recovery configuration
+NETWORK_CHECK_INTERVAL = 10        # seconds between network availability checks
+NETWORK_MAX_WAIT = 5 * 60 * 60     # max seconds to wait (5 hours) before giving up on a file
+NETWORK_RETRY_ENABLED = True       # whether to wait for network rather than fail immediately
+
 # Pause menu UI behavior
 MENU_CLEAR_CONSOLE = True   # Clear console before showing the pause menu
 MENU_SETTLE_MS = 250        # Delay (ms) before showing menu so worker messages settle
@@ -388,6 +393,55 @@ def display_progress():
     
     sys.stdout.flush()
 
+def is_network_path(path):
+    """Heuristic to detect a UNC network path (\\\\server\\share\\...)."""
+    if not path:
+        return False
+    # UNC path starts with two backslashes
+    return path.startswith('\\\\')
+
+def get_unc_root(path):
+    """Return the \\server\share root for a UNC path, else None."""
+    if not is_network_path(path):
+        return None
+    parts = path.strip('\\').split('\\')
+    if len(parts) >= 2:
+        return f"\\\\{parts[0]}\\{parts[1]}"
+    return None
+
+def wait_for_network(path, thread_id=None):
+    """Wait for network path to become available. Returns True if available, False if timed out."""
+    if not NETWORK_RETRY_ENABLED:
+        return True
+    if not is_network_path(path):
+        return True
+    root = get_unc_root(path) or path
+    start = time.time()
+    notified = False
+    while True:
+        try:
+            # Try listing root to wake connection
+            os.listdir(root)
+            return True
+        except Exception as e:
+            if time.time() - start > NETWORK_MAX_WAIT:
+                if not QUIET:
+                    print(f"[{thread_id or 'MAIN'}] NETWORK TIMEOUT: {root} still unavailable after {NETWORK_MAX_WAIT}s: {e}")
+                return False
+            # Provide periodic feedback
+            if not QUIET:
+                if not notified:
+                    print(f"[{thread_id or 'MAIN'}] Waiting for network share {root} to become available...")
+                    notified = True
+                elif int(time.time() - start) % 60 == 0:  # every minute
+                    print(f"[{thread_id or 'MAIN'}] Still waiting for network share {root} ({int(time.time() - start)}s)...")
+            # Update progress status if in a worker
+            if thread_id and SHOW_PROGRESS and not suppress_progress_display.is_set():
+                update_progress(thread_id, os.path.basename(path), 0, "WaitingNet")
+            if shutdown_requested.is_set():
+                return False
+            time.sleep(NETWORK_CHECK_INTERVAL)
+
 def clear_progress(thread_id):
     """Remove progress tracking for a completed thread"""
     if not SHOW_PROGRESS:
@@ -600,6 +654,11 @@ def transcode_file(filepath, root_backup_dir):
         # Don't log cancelled jobs as failed
         return None  # Return None to indicate cancellation, not failure
     
+    # Ensure network path (if any) is available before starting
+    if not wait_for_network(filepath, thread_id):
+        log_result(filepath, "failed_network_unavailable")
+        return False
+
     # Initialize progress
     update_progress(thread_id, filename, 0, "Starting")
     
@@ -650,8 +709,24 @@ def transcode_file(filepath, root_backup_dir):
     temp_fd, temp_path = tempfile.mkstemp(suffix=ext, dir=local_temp_dir)
     os.close(temp_fd)
 
-    # Get original file size
-    original_size = os.path.getsize(filepath)
+    # Get original file size (with network retry if needed)
+    try:
+        original_size = os.path.getsize(filepath)
+    except OSError as e:
+        # Potential transient network failure; attempt wait once more
+        if wait_for_network(filepath, thread_id):
+            try:
+                original_size = os.path.getsize(filepath)
+            except Exception as e2:
+                log_result(filepath, "failed_network_stat")
+                if not QUIET:
+                    print(f"[{thread_id}] NETWORK ERROR: Could not stat file after retry: {e2}")
+                return False
+        else:
+            log_result(filepath, "failed_network_unavailable")
+            if not QUIET:
+                print(f"[{thread_id}] NETWORK UNAVAILABLE: {filepath}")
+            return False
     update_progress(thread_id, filename, 5, "Preparing")
 
     cmd = [
@@ -704,15 +779,30 @@ def transcode_file(filepath, root_backup_dir):
             if IS_WINDOWS:
                 creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-            handbrake_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                creationflags=creationflags
-            )
+            try:
+                handbrake_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    creationflags=creationflags
+                )
+            except OSError as e:
+                # Possibly network path vanished; attempt to wait and retry once
+                if wait_for_network(filepath, thread_id):
+                    handbrake_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                        creationflags=creationflags
+                    )
+                else:
+                    raise
             
             stdout_lines = []
             
