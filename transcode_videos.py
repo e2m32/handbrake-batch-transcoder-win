@@ -47,6 +47,8 @@ PRESET = "Fast 1080p30 Subs"
 PRESET_JSON = os.path.join(SCRIPT_DIR, "fast1080p30subs.json")
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv"}
 LOG_FILE = os.path.join(SCRIPT_DIR, "transcode_log.csv")
+# Separate log for failures (to keep main log clean of persistent failed rows)
+FAILED_LOG_FILE = os.path.join(SCRIPT_DIR, "transcode_failed_log.csv")
 MAX_WORKERS = 4  # Number of concurrent transcode operations
 CREATE_BACKUPS = False  # Whether to create backups of original files
 BACKUP_SUBDIR = "backups"  # Subdirectory name for backups (relative to processed directory)
@@ -405,23 +407,70 @@ def load_processed_files():
                 processed[row["filepath"]] = row["status"]
     return processed
 
+# === Purge failed entries from main log and move them to failed log ===
+def purge_failed_entries():
+    """Remove rows with status == 'failed' from the main log and append them to FAILED_LOG_FILE."""
+    if not os.path.exists(LOG_FILE):
+        return
+    try:
+        with log_lock:  # ensure no concurrent writes while purging
+            with open(LOG_FILE, "r", newline="", encoding="utf-8") as f:
+                reader = list(csv.reader(f))
+            if not reader:
+                return
+            header = reader[0]
+            # Ensure header has expected columns; if not, skip purge to avoid corruption
+            if "status" not in header or "filepath" not in header:
+                return
+            status_idx = header.index("status")
+            # Separate rows
+            kept_rows = [header]
+            failed_rows = []
+            for row in reader[1:]:
+                if len(row) <= status_idx:
+                    kept_rows.append(row)
+                    continue
+                if row[status_idx] == "failed":
+                    failed_rows.append(row)
+                else:
+                    kept_rows.append(row)
+            # Only rewrite if we actually removed something
+            if failed_rows:
+                # Rewrite main log without failed rows
+                with open(LOG_FILE, "w", newline="", encoding="utf-8") as f_out:
+                    writer = csv.writer(f_out)
+                    writer.writerows(kept_rows)
+                # Append failed rows to failed log (create header if needed)
+                write_header = not os.path.exists(FAILED_LOG_FILE) or os.path.getsize(FAILED_LOG_FILE) == 0
+                with open(FAILED_LOG_FILE, "a", newline="", encoding="utf-8") as f_failed:
+                    writer_f = csv.writer(f_failed)
+                    if write_header:
+                        writer_f.writerow(header)
+                    writer_f.writerows(failed_rows)
+    except Exception as e:
+        # Non-fatal; just report once
+        if not QUIET:
+            print(f"WARNING: Could not purge failed entries: {e}")
+
 # === Append result to log ===
 def log_result(filepath, status, before_size=None, after_size=None):
+    # Decide which log file to use
+    target_log = FAILED_LOG_FILE if status == "failed" else LOG_FILE
     with log_lock:  # Thread-safe logging
-        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        with open(target_log, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if f.tell() == 0:
                 writer.writerow(["filepath", "status", "timestamp", "before_size_mb", "after_size_mb", "compression_ratio"])
-            
+
             # Calculate compression ratio if both sizes are available
             compression_ratio = ""
             if before_size is not None and after_size is not None and before_size > 0:
                 compression_ratio = f"{(after_size / before_size):.3f}"
-            
+
             # Convert sizes to MB
             before_mb = f"{before_size / (1024*1024):.2f}" if before_size is not None else ""
             after_mb = f"{after_size / (1024*1024):.2f}" if after_size is not None else ""
-            
+
             writer.writerow([filepath, status, datetime.now().isoformat(), before_mb, after_mb, compression_ratio])
 
 # === Check file type ===
@@ -1276,6 +1325,9 @@ def process_directory(root_dir):
 if __name__ == "__main__":
     import sys
     
+    # Purge any existing failed rows from main log (one-time per run)
+    purge_failed_entries()
+
     # Windows-only warning (do not exit)
     if not IS_WINDOWS:
         print("Warning: This script is designed for Windows. Some pause/resume features may not work on non-Windows systems.")

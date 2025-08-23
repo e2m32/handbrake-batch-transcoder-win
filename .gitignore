@@ -1,6 +1,7 @@
 # Logs
 transcode_log.csv
 retranscode_log.csv
+transcode_failed_log.csv
 *.log
 
 # OS files
