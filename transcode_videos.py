@@ -82,6 +82,22 @@ pause_requested = threading.Event()  # Signal that pause was requested
 menu_thread = None
 suppress_progress_display = threading.Event()  # When set, progress UI is muted
 
+def _print_worker_event(message):
+    """Print a one-line worker event message without permanently breaking the progress layout.
+    Messages are informational; in SHOW_PROGRESS mode they may be overwritten by later redraws.
+    """
+    if QUIET:
+        return
+    try:
+        # Temporarily suppress progress redraw while printing
+        saved = suppress_progress_display.is_set()
+        suppress_progress_display.set()
+        print(message)
+        if not saved:
+            suppress_progress_display.clear()
+    except Exception:
+        pass
+
 # Windows Console Control Handler (reliable Ctrl+C on Windows)
 console_ctrl_handler_ref = None  # Keep a reference to prevent GC
 
@@ -675,8 +691,7 @@ def transcode_file(filepath, root_backup_dir):
         clear_progress(thread_id)
         original_size = os.path.getsize(filepath)
         log_result(filepath, f"skipped_low_res_{resolution_info}", original_size)
-        if not SHOW_PROGRESS:
-            print(f"[{thread_id}] SKIP: Low resolution ({resolution_info}): {filepath}")
+        _print_worker_event(f"[{thread_id}] SKIP low-res {resolution_info}: {filepath}")
         return True  # Return True since this is successful processing (just skipped)
     
     # Check if transcoding will likely result in larger file
@@ -692,8 +707,7 @@ def transcode_file(filepath, root_backup_dir):
         clear_progress(thread_id)
         original_size = os.path.getsize(filepath)
         log_result(filepath, f"skipped_likely_larger_{codec_info.replace(' ', '_').replace('(', '').replace(')', '')}", original_size)
-        if not SHOW_PROGRESS:
-            print(f"[{thread_id}] SKIP: Likely to be larger ({codec_info}): {filepath}")
+        _print_worker_event(f"[{thread_id}] SKIP likely larger ({codec_info}): {filepath}")
         return True  # Return True since this is successful processing (just skipped)
 
     # Check for pause/shutdown before starting expensive transcode
@@ -1028,9 +1042,11 @@ def transcode_file(filepath, root_backup_dir):
             if not QUIET and not SHOW_PROGRESS:
                 print(f"[{thread_id}] INTERRUPTED: File was paused during execution, marking as interrupted for retry")
             log_result(filepath, "interrupted", original_size)
+            _print_worker_event(f"[{thread_id}] INTERRUPTED (during transcode): {filepath}")
             return None  # Treat as interruption, not failure
         else:
             log_result(filepath, "failed", original_size)
+            _print_worker_event(f"[{thread_id}] FAIL (return code {result.returncode}): {filepath}")
             return False
 
     # Check if temp file was actually created and has content
@@ -1039,6 +1055,7 @@ def transcode_file(filepath, root_backup_dir):
         if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] ERROR: Temp file was not created: {temp_path}")
         log_result(filepath, "failed", original_size)
+        _print_worker_event(f"[{thread_id}] FAIL (no temp output): {filepath}")
         return False
     
     # Get transcoded file size
@@ -1049,6 +1066,7 @@ def transcode_file(filepath, root_backup_dir):
             print(f"[{thread_id}] ERROR: Transcoded file is empty: {temp_path}")
         os.remove(temp_path)
         log_result(filepath, "failed", original_size)
+        _print_worker_event(f"[{thread_id}] FAIL (empty output): {filepath}")
         return False
     
     update_progress(thread_id, filename, 90, "Backing up")
@@ -1066,6 +1084,7 @@ def transcode_file(filepath, root_backup_dir):
         
         # Log as skipped due to larger size
         log_result(filepath, f"skipped_larger_size_{compression_ratio:.3f}", original_size, transcoded_size)
+        _print_worker_event(f"[{thread_id}] SKIP larger result {compression_ratio:.3f}: {filepath}")
         return True  # Return True since this is successful processing (just skipped)
 
     # Check for pause/shutdown before final operations
@@ -1103,6 +1122,7 @@ def transcode_file(filepath, root_backup_dir):
         
         if not QUIET and not SHOW_PROGRESS:
             print(f"[{thread_id}] SUCCESS: {filepath} ({original_size / (1024*1024):.2f} MB -> {transcoded_size / (1024*1024):.2f} MB, ratio: {compression_ratio:.3f})")
+        _print_worker_event(f"[{thread_id}] OK {compression_ratio:.3f} {os.path.basename(filepath)}")
         
         return True
     except Exception as e:
@@ -1112,6 +1132,7 @@ def transcode_file(filepath, root_backup_dir):
         if os.path.exists(temp_path):
             os.remove(temp_path)
         log_result(filepath, "failed", original_size)
+        _print_worker_event(f"[{thread_id}] FAIL (final move error): {filepath}")
         return False
 
 # === Worker function for thread pool ===
