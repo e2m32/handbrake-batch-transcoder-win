@@ -62,6 +62,11 @@ NETWORK_CHECK_INTERVAL = 10        # seconds between network availability checks
 NETWORK_MAX_WAIT = 5 * 60 * 60     # max seconds to wait (5 hours) before giving up on a file
 NETWORK_RETRY_ENABLED = True       # whether to wait for network rather than fail immediately
 
+# Finalization (move/replace) retry configuration
+FINAL_MOVE_RETRIES = 5             # number of attempts to move temp file to destination
+FINAL_MOVE_RETRY_DELAY = 15        # initial delay (seconds) before first retry
+FINAL_MOVE_BACKOFF_FACTOR = 2      # exponential backoff multiplier
+
 # Pause menu UI behavior
 MENU_CLEAR_CONSOLE = True   # Clear console before showing the pause menu
 MENU_SETTLE_MS = 250        # Delay (ms) before showing menu so worker messages settle
@@ -1112,28 +1117,35 @@ def transcode_file(filepath, root_backup_dir):
     update_progress(thread_id, filename, 95, "Finalizing")
     
     # Replace original
-    try:
-        shutil.move(temp_path, filepath)
-        log_result(filepath, "success", original_size, transcoded_size)
-        
-        update_progress(thread_id, filename, 100, "Complete")
-        time.sleep(0.5)  # Brief pause to show completion
-        clear_progress(thread_id)
-        
-        if not QUIET and not SHOW_PROGRESS:
-            print(f"[{thread_id}] SUCCESS: {filepath} ({original_size / (1024*1024):.2f} MB -> {transcoded_size / (1024*1024):.2f} MB, ratio: {compression_ratio:.3f})")
-        _print_worker_event(f"[{thread_id}] OK {compression_ratio:.3f} {os.path.basename(filepath)}")
-        
-        return True
-    except Exception as e:
-        clear_progress(thread_id)
-        if not QUIET and not SHOW_PROGRESS:
-            print(f"[{thread_id}] ERROR: Could not move file from {temp_path} to {filepath}: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        log_result(filepath, "failed", original_size)
-        _print_worker_event(f"[{thread_id}] FAIL (final move error): {filepath}")
-        return False
+    move_attempt = 0
+    delay = FINAL_MOVE_RETRY_DELAY
+    while True:
+        try:
+            shutil.move(temp_path, filepath)
+            log_result(filepath, "success", original_size, transcoded_size)
+            update_progress(thread_id, filename, 100, "Complete")
+            time.sleep(0.5)
+            clear_progress(thread_id)
+            if not QUIET and not SHOW_PROGRESS:
+                print(f"[{thread_id}] SUCCESS: {filepath} ({original_size / (1024*1024):.2f} MB -> {transcoded_size / (1024*1024):.2f} MB, ratio: {compression_ratio:.3f})")
+            _print_worker_event(f"[{thread_id}] OK {compression_ratio:.3f} {os.path.basename(filepath)}")
+            return True
+        except Exception as e:
+            move_attempt += 1
+            if move_attempt > FINAL_MOVE_RETRIES:
+                clear_progress(thread_id)
+                if not QUIET and not SHOW_PROGRESS:
+                    print(f"[{thread_id}] ERROR: Final move failed after {FINAL_MOVE_RETRIES} retries: {e}")
+                # Best effort cleanup: if temp still exists, leave it for manual recovery instead of deleting
+                log_result(filepath, "failed", original_size)
+                _print_worker_event(f"[{thread_id}] FAIL (final move exhausted retries): {filepath}")
+                return False
+            # Attempt network wait (UNC only)
+            wait_for_network(filepath, thread_id)
+            if not QUIET:
+                _print_worker_event(f"[{thread_id}] RETRY move {move_attempt}/{FINAL_MOVE_RETRIES} in {delay}s: {os.path.basename(filepath)} -> {e}")
+            time.sleep(delay)
+            delay *= FINAL_MOVE_BACKOFF_FACTOR
 
 # === Worker function for thread pool ===
 def process_file_worker(filepath, root_backup_dir):

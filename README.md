@@ -47,6 +47,7 @@ python transcode_videos.py "C:\\Videos\\Movies" 4 --quiet
 - **Separate failed log** - `transcode_failed_log.csv` stores only failures; main log stays clean
 - **Size comparison** - Before/after file sizes and compression ratios
 - **Intelligent skip detection** - Separate tracking for different skip reasons
+- **Final move retry** - Automatically retries placing the final transcoded file (helps with transient network hiccups)
 
 ### 🔧 Windows-only Support
 - **Windows process control** - Full process suspension/resume support
@@ -100,6 +101,22 @@ SHOW_PROGRESS = True          # Enable real-time progress bars
 PRESET = "Fast 1080p30 Subs"           # HandBrake encoding preset (by name)
 PRESET_JSON = "fast1080p30subs.json"   # Preset file path (imported at runtime)
 ```
+
+### Network & Finalization Reliability
+
+```python
+# Network share resilience
+NETWORK_CHECK_INTERVAL = 10        # seconds between network availability checks
+NETWORK_MAX_WAIT = 5 * 60 * 60     # max seconds to wait (5 hours)
+NETWORK_RETRY_ENABLED = True       # enable waiting instead of failing fast
+
+# Final move (rename) retry
+FINAL_MOVE_RETRIES = 5             # attempts to move temp file into place
+FINAL_MOVE_RETRY_DELAY = 15        # initial delay before first retry (seconds)
+FINAL_MOVE_BACKOFF_FACTOR = 2      # exponential backoff multiplier
+```
+
+These help the script survive Wi-Fi adapter sleep, NAS spin-up delays, and transient SMB hiccups.
 
 ## Usage
 
@@ -227,6 +244,7 @@ This reveals:
 - Separate failed runs into `transcode_failed_log.csv`
 - Added UNC network share wait/retry (configurable) to survive network adapter sleep
 - Added network recovery constants (`NETWORK_CHECK_INTERVAL`, `NETWORK_MAX_WAIT`, `NETWORK_RETRY_ENABLED`)
+- Added final move retry with exponential backoff (`FINAL_MOVE_RETRIES`, `FINAL_MOVE_RETRY_DELAY`, `FINAL_MOVE_BACKOFF_FACTOR`)
 - Internal refactors / minor robustness fixes
 
 ### v0.5.1
