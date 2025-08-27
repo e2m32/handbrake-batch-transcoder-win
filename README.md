@@ -240,7 +240,13 @@ This reveals:
 
 ## Version History
 
-### v0.5.2 (Current)
+### v0.6.0 (Current)
+- Added final move retry with exponential backoff (`FINAL_MOVE_RETRIES`, `FINAL_MOVE_RETRY_DELAY`, `FINAL_MOVE_BACKOFF_FACTOR`)
+- Enhanced network resilience features consolidated (UNC wait + finalization retries)
+- Documentation improvements and configuration section for reliability settings
+- Internal refactors / minor robustness fixes
+
+### v0.5.2
 - Separate failed runs into `transcode_failed_log.csv`
 - Added UNC network share wait/retry (configurable) to survive network adapter sleep
 - Added network recovery constants (`NETWORK_CHECK_INTERVAL`, `NETWORK_MAX_WAIT`, `NETWORK_RETRY_ENABLED`)
