@@ -240,7 +240,11 @@ This reveals:
 
 ## Version History
 
-### v0.6.0 (Current)
+### v0.7.0 (Current)
+- Mapped HandBrake exit codes to human-readable reasons in failure output
+- Enhanced failure event line to include rc and explanation
+
+### v0.6.0
 - Added final move retry with exponential backoff (`FINAL_MOVE_RETRIES`, `FINAL_MOVE_RETRY_DELAY`, `FINAL_MOVE_BACKOFF_FACTOR`)
 - Enhanced network resilience features consolidated (UNC wait + finalization retries)
 - Documentation improvements and configuration section for reliability settings

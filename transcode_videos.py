@@ -39,7 +39,7 @@ else:
 # (removed keyboard monitoring variables as they don't work with terminal Ctrl+C)
 
 # === Version ===
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # === Config ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -502,6 +502,19 @@ def log_result(filepath, status, before_size=None, after_size=None):
             after_mb = f"{after_size / (1024*1024):.2f}" if after_size is not None else ""
 
             writer.writerow([filepath, status, datetime.now().isoformat(), before_mb, after_mb, compression_ratio])
+
+# HandBrake exit code explanations (common subset)
+HANDBRAKE_EXIT_CODE_INFO = {
+    1: "Unknown error / General failure",
+    2: "Invalid input / Read error (source file or stream issue)",
+    3: "Initialization failure (codec/setup)",
+    4: "Video encoding failure (codec crash)",
+    5: "Muxing / Write error (disk full, permission, network share lost)",
+    6: "User aborted (signal)",
+}
+
+def describe_exit_code(code):
+    return HANDBRAKE_EXIT_CODE_INFO.get(code, "Unknown / Unmapped exit code")
 
 # === Check file type ===
 def is_video_file(filename):
@@ -1036,7 +1049,7 @@ def transcode_file(filepath, root_backup_dir):
         clear_progress(thread_id)
         if not SHOW_PROGRESS:
             print(f"[{thread_id}] ERROR: {filepath}")
-            print(f"[{thread_id}] Return code: {result.returncode}")
+            print(f"[{thread_id}] Return code: {result.returncode} -> {describe_exit_code(result.returncode)}")
             print(f"[{thread_id}] STDOUT: {result.stdout}")
             print(f"[{thread_id}] STDERR: {result.stderr}")
         if os.path.exists(temp_path):
@@ -1050,8 +1063,9 @@ def transcode_file(filepath, root_backup_dir):
             _print_worker_event(f"[{thread_id}] INTERRUPTED (during transcode): {filepath}")
             return None  # Treat as interruption, not failure
         else:
+            reason = describe_exit_code(result.returncode)
             log_result(filepath, "failed", original_size)
-            _print_worker_event(f"[{thread_id}] FAIL (return code {result.returncode}): {filepath}")
+            _print_worker_event(f"[{thread_id}] FAIL rc={result.returncode} ({reason}): {filepath}")
             return False
 
     # Check if temp file was actually created and has content
